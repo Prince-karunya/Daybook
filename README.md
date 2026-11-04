@@ -1,4 +1,4 @@
-# Daybook College
+# Daybook
 
 A React + FastAPI MCA department portal for HOD-managed AMCA (first-year) and NMCA (second-year) timetables, faculty schedules, automatic day-order rotation, campus contacts, and timetable message previews.
 
