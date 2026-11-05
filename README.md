@@ -30,6 +30,21 @@ The API creates `backend/daybook.db` on first run, migrates the earlier local da
 
 The day-order cycle starts with Day Order 1 on the date of the first API startup. HOD can change the cycle start date and its day order in Settings; each calendar day advances the order, wrapping from 6 back to 1. The dashboard refreshes the calculated order automatically.
 
+## Deploy
+
+The Vercel deployment serves the React frontend. Deploy the FastAPI backend separately on a Python ASGI host with a persistent PostgreSQL database; Vercel's static frontend cannot run the local SQLite database or the Vite development proxy.
+
+1. Import the repository into Vercel using the repository root. `vercel.json` configures `npm run build`, the `dist` output, and client-side route fallback.
+2. Deploy the `backend.main:app` FastAPI application on an ASGI host. A typical start command is `uvicorn backend.main:app --host 0.0.0.0 --port $PORT`.
+3. Configure these environment variables on the backend:
+   - `DATABASE_URL`: persistent PostgreSQL connection URL.
+   - `DAYBOOK_ENV`: `production`.
+   - `DAYBOOK_HOD_EMAIL`, `DAYBOOK_HOD_PASSWORD`, and `DAYBOOK_SECRET_KEY`: secure production-only values. The configured HOD credentials are used only when the database is first initialized.
+   - `DAYBOOK_CORS_ORIGINS`: comma-separated allowed frontend origins, including `https://day-order-reminder.vercel.app`.
+4. Set `VITE_API_BASE_URL` in the Vercel project's environment variables to the backend's base URL (for example, `https://your-api.example.com`, without `/api`), then redeploy. The frontend displays a clear configuration error rather than silently sending production API requests to itself if this value is missing.
+
+Do not use the local SQLite database for production hosting: its file is not shared or durable on serverless hosts. Keep the database URL, HOD password, and signing key out of source control.
+
 ## Message previews
 
 The **SMS activity** page retains separate custom-message composers for AMCA students, NMCA students, and faculty. You can draft a message, review eligible opted-in contacts, and generate timetable previews for the selected cohort. Preview messages can be saved to SQL message history and are never delivered.
