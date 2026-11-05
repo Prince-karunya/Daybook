@@ -5,10 +5,11 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    f"sqlite:///{Path(__file__).with_name('daybook.db').as_posix()}",
-)
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    if os.getenv("VERCEL") or os.getenv("DAYBOOK_ENV", "development").lower() == "production":
+        raise RuntimeError("DATABASE_URL must be set to a persistent PostgreSQL database in production.")
+    DATABASE_URL = f"sqlite:///{Path(__file__).with_name('daybook.db').as_posix()}"
 if DATABASE_URL.startswith(("postgres://", "postgresql://")):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
     if DATABASE_URL.startswith("postgresql://"):

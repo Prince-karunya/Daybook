@@ -27,9 +27,6 @@ const navigation = [
 ];
 
 async function api(path, options) {
-  if (import.meta.env.PROD && !apiBaseUrl) {
-    throw new Error("The API is not configured. Set VITE_API_BASE_URL to your deployed backend URL.");
-  }
   const token = sessionStorage.getItem("daybook-hod-token");
   const headers = { "Content-Type": "application/json", ...options?.headers };
   if (token) headers.Authorization = `Bearer ${token}`;
