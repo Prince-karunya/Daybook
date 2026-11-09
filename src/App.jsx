@@ -846,8 +846,10 @@ function MatrixRow({ order, schedule, active, onSelect, onAdd, onEdit }) {
   while (hour <= 6) {
     const entry = schedule.find((period) => period.period_number === hour);
     if (entry) {
-      cells.push(<td key={hour} colSpan={entry.duration_hours} className={entry.subject.trim().toUpperCase().endsWith("LAB") ? "matrix-subject lab-cell" : "matrix-subject"}><button className="matrix-entry-button" onClick={() => onEdit(entry)} title={`Edit ${entry.subject}, hours ${entry.period_number} to ${entry.period_number + entry.duration_hours - 1}`}><strong>{entry.subject}</strong><span>Edit</span></button></td>);
-      hour += entry.duration_hours;
+      const duration = Math.max(1, Math.min(entry.duration_hours, 7 - hour));
+      const lastHour = hour + duration - 1;
+      cells.push(<td key={hour} colSpan={duration} className={`matrix-subject${duration > 1 ? " multi-hour-cell" : ""}`}><button className="matrix-entry-button" onClick={() => onEdit(entry)} title={`Edit ${entry.subject}, hours ${hour} to ${lastHour}`}><strong>{entry.subject}</strong><span>Edit</span></button></td>);
+      hour += duration;
     } else {
       const covered = schedule.some((period) => period.period_number < hour && period.period_number + period.duration_hours > hour);
       if (!covered) cells.push(<td key={hour} className="empty-hour" />);
