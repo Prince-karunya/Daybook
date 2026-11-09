@@ -30,6 +30,8 @@ The API creates `backend/daybook.db` on first run, migrates the earlier local da
 
 The day-order cycle starts with Day Order 1 on the date of the first API startup. HOD can change the cycle start date and its day order in Settings; each calendar day advances the order, wrapping from 6 back to 1. The dashboard refreshes the calculated order automatically.
 
+On the initial database migration, the AMCA timetable is rotated one day order earlier so its lab days start at Day Order 1; NMCA remains unchanged.
+
 ## Deploy
 
 The Vercel deployment serves the React frontend and FastAPI backend from the same domain. The backend requires a persistent PostgreSQL database; do not rely on local SQLite for Vercel serverless deployments.

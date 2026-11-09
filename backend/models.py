@@ -45,6 +45,7 @@ class AppSetting(Base):
     anchor_day_order: Mapped[int] = mapped_column(Integer, default=1)
     reminder_time: Mapped[str] = mapped_column(String(5), default="07:00")
     reminder_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    amca_lab_rotation_applied: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class HodUser(Base):

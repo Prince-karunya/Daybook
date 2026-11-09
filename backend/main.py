@@ -272,6 +272,25 @@ def seed_database() -> None:
         db.commit()
 
 
+def rotate_amca_timetable_for_lab_days() -> None:
+    with SessionLocal.begin() as db:
+        claimed = db.execute(
+            text(
+                "UPDATE settings SET amca_lab_rotation_applied = TRUE "
+                "WHERE id = (SELECT id FROM settings ORDER BY id LIMIT 1) "
+                "AND amca_lab_rotation_applied = FALSE"
+            )
+        )
+        if claimed.rowcount:
+            db.execute(
+                text(
+                    "UPDATE periods SET day_order = "
+                    "CASE WHEN day_order = 1 THEN 6 ELSE day_order - 1 END "
+                    "WHERE cohort = 'AMCA'"
+                )
+            )
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
@@ -293,6 +312,11 @@ async def lifespan(_: FastAPI):
         with engine.begin() as connection:
             connection.execute(
                 text("ALTER TABLE settings ADD COLUMN anchor_day_order INTEGER NOT NULL DEFAULT 1")
+            )
+    if "amca_lab_rotation_applied" not in settings_columns:
+        with engine.begin() as connection:
+            connection.execute(
+                text("ALTER TABLE settings ADD COLUMN amca_lab_rotation_applied BOOLEAN NOT NULL DEFAULT FALSE")
             )
     message_columns = {column["name"] for column in inspect(engine).get_columns("message_logs")}
     if "cohort" not in message_columns:
@@ -332,6 +356,7 @@ async def lifespan(_: FastAPI):
         with engine.begin() as connection:
             connection.execute(text("ALTER TABLE people ADD COLUMN email_opt_in BOOLEAN NOT NULL DEFAULT FALSE"))
     seed_database()
+    rotate_amca_timetable_for_lab_days()
     yield
 
 
