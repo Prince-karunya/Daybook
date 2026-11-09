@@ -39,15 +39,16 @@ The Vercel deployment serves the React frontend and FastAPI backend from the sam
 3. Set these Vercel environment variables for Production:
    - `DAYBOOK_ENV`: `production`.
    - `DAYBOOK_HOD_EMAIL`, `DAYBOOK_HOD_PASSWORD`, and `DAYBOOK_SECRET_KEY`: secure production-only values. These initial HOD credentials are used only when the database is first initialized.
-4. Redeploy after adding or changing environment variables. The frontend calls `/api` on the same Vercel domain, so `VITE_API_BASE_URL` and cross-origin configuration are not required.
+4. Configure Gmail SMTP with `GMAIL_ADDRESS` and `GMAIL_APP_PASSWORD` (a Gmail App Password; use a separate Secret environment variable for the password). Configure `CRON_SECRET` as a long random secret to authorize the scheduled reminder route.
+5. Redeploy after adding or changing environment variables. The frontend calls `/api` on the same Vercel domain, so `VITE_API_BASE_URL` and cross-origin configuration are not required.
 
 Vercel deployments refuse to start the API without `DATABASE_URL` in production rather than falling back to an ephemeral SQLite file. Keep the database URL, HOD password, and signing key out of source control.
 
-## Message previews
+## Email notices
 
-The **SMS activity** page retains separate custom-message composers for AMCA students, NMCA students, and faculty. You can draft a message, review eligible opted-in contacts, and generate timetable previews for the selected cohort. Preview messages can be saved to SQL message history and are never delivered.
+The **Email activity** page supports custom messages to an AMCA/NMCA cohort or faculty, preview saving, and personalized daily timetable emails. Gmail sending uses SMTP with a Google App Password. Configure `GMAIL_ADDRESS`, `GMAIL_APP_PASSWORD`, and `CRON_SECRET` in Vercel Production; never commit them to source control. The Vercel cron sends daily at 7:00 AM India Standard Time and sends at most 100 messages per run. Custom sends are also limited to 100 recipients per request.
 
-SMS delivery and the daily reminder scheduler are currently disabled because no SMS provider is configured. Custom-message sending is disabled in the interface and the API rejects send requests without contacting a provider. The reminder time can still be configured for future use.
+Upload a CSV with the header `name,email,role,group_name`; `role` must be `Student` or `Teacher`, and students should use the `AMCA` or `NMCA` group. Imports can create contacts or update matching email addresses, and imported contacts are enabled for timetable emails. The People page provides a downloadable CSV template. Demo contacts are never emailed.
 
 ## HOD credentials
 
@@ -69,8 +70,8 @@ The account is created only when the database has no HOD account. The HOD can up
 - Calculate the current day order from a configurable cycle start date and starting order.
 - Restrict the portal and API to the HOD login.
 - Edit the HOD profile name and sign-in email, and securely change the password.
-- Search, add, edit, and remove students and faculty; phone changes require fresh SMS verification, and removed faculty assignments become unassigned.
+- Search, add, edit, remove, and bulk-import students and faculty with email contacts; removed faculty assignments become unassigned.
 - Save college and reminder settings in SQLite.
-- Generate student/faculty message previews and view message history; custom-message composers remain available while sending is disabled.
+- Send custom student/faculty emails, schedule personalized daily timetable emails, and view delivery history.
 
-Message previews are non-delivering, and there is no SMS provider integration or background delivery worker configured. Sample contacts are fictitious; replace them with authorized college data and deploy only behind HTTPS before production use.
+Message previews are non-delivering. Sample contacts are fictitious and cannot receive email. Use authorized college email addresses and deploy only behind HTTPS.

@@ -33,10 +33,9 @@ class PersonOut(BaseModel):
     name: str
     role: str
     group_name: str
-    phone: str
+    email: str
     is_active: bool
-    phone_verified: bool
-    sms_consent: bool
+    email_opt_in: bool
     is_sample: bool
 
 
@@ -44,21 +43,20 @@ class PersonCreate(BaseModel):
     name: str = Field(min_length=2, max_length=100)
     role: str = Field(pattern=r"^(Student|Teacher)$")
     group_name: str = Field(min_length=1, max_length=100)
-    phone: str = Field(pattern=r"^\+[1-9]\d{7,14}$")
-    phone_verified: bool = False
-    sms_consent: bool = False
+    email: str = Field(min_length=5, max_length=254, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    email_opt_in: bool = True
 
 
 class PersonUpdate(BaseModel):
     name: str = Field(min_length=2, max_length=100)
     role: str = Field(pattern=r"^(Student|Teacher)$")
     group_name: str = Field(min_length=1, max_length=100)
-    phone: str = Field(pattern=r"^\+[1-9]\d{7,14}$")
+    email: str = Field(min_length=5, max_length=254, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    email_opt_in: bool = True
 
 
-class PersonSmsStatus(BaseModel):
-    phone_verified: bool
-    sms_consent: bool
+class BulkPersonImport(BaseModel):
+    contacts: list[PersonCreate] = Field(min_length=1, max_length=500)
 
 
 class SettingOut(BaseModel):
@@ -121,6 +119,7 @@ class MessageOut(BaseModel):
     skipped_count: int
     delivery_note: str | None
     status: str
+    subject: str
     student_message: str
     teacher_message: str
     created_at: datetime
@@ -134,7 +133,14 @@ class PreviewRequest(BaseModel):
 class CustomMessageRequest(BaseModel):
     audience: str = Field(pattern=r"^(students|faculty)$")
     cohort: str | None = Field(default=None, pattern=r"^(AMCA|NMCA)$")
-    message: str = Field(min_length=1, max_length=1600)
+    subject: str = Field(min_length=1, max_length=200)
+    message: str = Field(min_length=1, max_length=10000)
+
+
+class BulkImportResult(BaseModel):
+    created: int
+    updated: int
+    skipped: int
 
 
 class PreviewResult(BaseModel):

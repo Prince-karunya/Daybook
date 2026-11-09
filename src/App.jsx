@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowLeft, Bell, BookOpen, CalendarDays, Check, ChevronRight, Clock3, Eye, EyeOff, Grid2X2, House,
-  Menu, MessageCircle, Pencil, Plus, Search, Send, Settings2, Sparkles, UserRound, Users, X,
+  Mail, Menu, MessageCircle, Pencil, Plus, Search, Send, Settings2, Sparkles, Upload, UserRound, Users, X,
 } from "lucide-react";
 
 const dayOrders = [1, 2, 3, 4, 5, 6];
@@ -22,9 +22,54 @@ const navigation = [
   { id: "student", label: "Student timetable", Icon: CalendarDays },
   { id: "faculty", label: "Faculty timetable", Icon: BookOpen },
   { id: "people", label: "People", Icon: Users },
-  { id: "messages", label: "SMS activity", Icon: MessageCircle },
+  { id: "messages", label: "Email activity", Icon: Mail },
   { id: "profile", label: "Profile", Icon: UserRound },
 ];
+
+function parseRosterCsv(text) {
+  const rows = [];
+  let row = [];
+  let field = "";
+  let quoted = false;
+  const source = text.replace(/^\uFEFF/, "");
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    if (quoted && character === '"' && source[index + 1] === '"') {
+      field += '"';
+      index += 1;
+    } else if (character === '"') {
+      quoted = !quoted;
+    } else if (character === "," && !quoted) {
+      row.push(field.trim());
+      field = "";
+    } else if ((character === "\n" || character === "\r") && !quoted) {
+      row.push(field.trim());
+      if (row.some(Boolean)) rows.push(row);
+      row = [];
+      field = "";
+      if (character === "\r" && source[index + 1] === "\n") index += 1;
+    } else {
+      field += character;
+    }
+  }
+  if (quoted) throw new Error("The CSV has an unclosed quoted field.");
+  row.push(field.trim());
+  if (row.some(Boolean)) rows.push(row);
+  if (rows.length < 2) throw new Error("The CSV needs a header row and at least one contact.");
+  const headers = rows[0].map((header) => header.trim().toLowerCase());
+  const required = ["name", "email", "role", "group_name"];
+  const columns = required.map((header) => headers.indexOf(header));
+  if (columns.some((column) => column < 0)) {
+    throw new Error("CSV headers must be name,email,role,group_name.");
+  }
+  return rows.slice(1).map((cells, index) => {
+    const [name, email, role, group_name] = columns.map((column) => cells[column] || "");
+    if (!name || !email || !role || !group_name) {
+      throw new Error(`CSV row ${index + 2} is missing a required value.`);
+    }
+    return { name, email: email.toLowerCase(), role, group_name, email_opt_in: true };
+  });
+}
 
 async function api(path, options) {
   const token = sessionStorage.getItem("daybook-hod-token");
@@ -112,8 +157,11 @@ function App() {
   const [search, setSearch] = useState("");
   const [customAudience, setCustomAudience] = useState("students");
   const [customCohort, setCustomCohort] = useState("AMCA");
+  const [customSubject, setCustomSubject] = useState("");
   const [customMessage, setCustomMessage] = useState("");
   const [customBusy, setCustomBusy] = useState(false);
+  const [importBusy, setImportBusy] = useState(false);
+  const rosterFileInput = useRef(null);
   const [modal, setModal] = useState("");
   const [toast, setToast] = useState("");
   const [busy, setBusy] = useState(false);
@@ -213,7 +261,7 @@ function App() {
   const activePeople = useMemo(() => people.filter((person) => {
     const matchesRole = filter === "Everyone" || person.role === filter.slice(0, -1);
     const term = search.trim().toLowerCase();
-    const matchesSearch = !term || `${person.name} ${person.group_name} ${person.phone}`.toLowerCase().includes(term);
+    const matchesSearch = !term || `${person.name} ${person.group_name} ${person.email}`.toLowerCase().includes(term);
     return matchesRole && matchesSearch;
   }), [filter, people, search]);
   const students = people.filter((person) => person.role === "Student");
@@ -221,18 +269,17 @@ function App() {
     cohorts.map((item) => [item, students.filter((person) => person.group_name === item)]),
   );
   const verifiedStudentsByCohort = Object.fromEntries(
-    cohorts.map((item) => [item, students.filter((person) => person.group_name === item && person.phone_verified && person.sms_consent && !person.is_sample).length]),
+    cohorts.map((item) => [item, students.filter((person) => person.group_name === item && person.email_opt_in && !person.is_sample).length]),
   );
   const teachers = people.filter((person) => person.role === "Teacher");
-  const verifiedStudents = students.filter((person) => person.phone_verified && person.sms_consent && !person.is_sample).length;
-  const verifiedTeachers = teachers.filter((person) => person.phone_verified && person.sms_consent && !person.is_sample).length;
+  const verifiedStudents = students.filter((person) => person.email_opt_in && !person.is_sample).length;
+  const verifiedTeachers = teachers.filter((person) => person.email_opt_in && !person.is_sample).length;
   const scheduledTeacherNames = new Set(
     cohorts.flatMap((item) => schedules[item][order - 1] || [])
       .map((period) => period.teacher_name.trim().toLowerCase()),
   );
   const verifiedScheduledTeachers = teachers.filter((person) => (
-    person.phone_verified
-    && person.sms_consent
+    person.email_opt_in
     && !person.is_sample
     && scheduledTeacherNames.has(person.name.trim().toLowerCase())
   )).length;
@@ -240,14 +287,13 @@ function App() {
     person.role === (customAudience === "students" ? "Student" : "Teacher")
     && (customAudience !== "students" || person.group_name === customCohort)
     && person.is_active
-    && person.phone_verified
-    && person.sms_consent
+    && person.email_opt_in
     && !person.is_sample
   ));
   const automationLabel = !automation.ready
-    ? "SMS provider not configured"
+    ? "Gmail not configured"
     : !automation.daily_enabled
-      ? "Custom SMS only"
+      ? "Custom email only"
       : !settings.reminder_enabled
     ? "Paused"
       : "Scheduled";
@@ -397,7 +443,7 @@ function App() {
       });
       setSettings(updated);
       setAutomation(await api("/messages/automation"));
-      setToast(enabled ? "Daily SMS schedule enabled." : "Daily SMS schedule paused.");
+      setToast(enabled ? "Daily email schedule enabled." : "Daily email schedule paused.");
     } catch (requestError) {
       setError(requestError.message);
     }
@@ -420,9 +466,9 @@ function App() {
   }
 
   async function sendCustomMessage() {
-    if (!automation.custom_ready || customRecipients.length === 0) return;
+    if (!automation.custom_ready || customRecipients.length === 0 || !customSubject.trim()) return;
     const audienceLabel = customAudience === "students" ? `${customCohort} students` : "faculty";
-    const confirmation = `Send this custom SMS now to ${customRecipients.length} eligible ${audienceLabel}?`;
+    const confirmation = `Send this email now to ${customRecipients.length} eligible ${audienceLabel}?`;
     if (!window.confirm(confirmation)) return;
     setCustomBusy(true);
     try {
@@ -431,16 +477,17 @@ function App() {
         body: JSON.stringify({
           audience: customAudience,
           cohort: customAudience === "students" ? customCohort : null,
+          subject: customSubject.trim(),
           message: customMessage.trim(),
         }),
       });
       setMessages(await api("/messages"));
       setToast(
         result.status === "no_recipients"
-          ? "No verified, opted-in recipients were available."
+          ? "No active, email-enabled recipients were available."
           : result.failed_count && result.sent_count === 0
-            ? `The SMS provider rejected the message for all ${result.failed_count} recipients. ${result.delivery_note || "Check message history for details."}`
-            : `SMS accepted by the provider for ${result.sent_count} of ${result.recipient_count} recipients${result.failed_count ? `; ${result.failed_count} failed` : ""}${result.skipped_count ? `; ${result.skipped_count} skipped` : ""}.${result.delivery_note ? ` ${result.delivery_note}` : ""}`,
+            ? `Gmail could not deliver to ${result.failed_count} recipients. ${result.delivery_note || "Check message history for details."}`
+            : `Gmail sent to ${result.sent_count} of ${result.recipient_count} recipients${result.failed_count ? `; ${result.failed_count} failed` : ""}.${result.delivery_note ? ` ${result.delivery_note}` : ""}`,
       );
     } catch (requestError) {
       setError(requestError.message);
@@ -449,22 +496,56 @@ function App() {
     }
   }
 
-  async function updatePersonSmsStatus(person) {
-    const enable = !person.phone_verified || !person.sms_consent;
-    if (enable && !window.confirm(`Confirm ${person.name}'s number is correct and they have opted in to daily SMS?`)) return;
+  async function updatePersonEmailStatus(person) {
+    const enable = !person.email_opt_in;
+    if (enable && !window.confirm(`Enable timetable emails to ${person.email}?`)) return;
     try {
-      await api(`/people/${person.id}/sms-status`, {
+      await api(`/people/${person.id}`, {
         method: "PUT",
         body: JSON.stringify({
-          phone_verified: enable ? true : person.phone_verified,
-          sms_consent: enable,
+          name: person.name,
+          role: person.role,
+          group_name: person.group_name,
+          email: person.email,
+          email_opt_in: enable,
         }),
       });
       setPeople(await api("/people"));
-      setToast(enable ? "SMS enabled for the verified, opted-in contact." : "SMS paused for this contact.");
+      setToast(enable ? "Timetable emails enabled for this contact." : "Timetable emails paused for this contact.");
     } catch (requestError) {
       setError(requestError.message);
     }
+  }
+
+  async function importRoster(event) {
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = "";
+    if (!file) return;
+    setImportBusy(true);
+    try {
+      const contacts = parseRosterCsv(await file.text());
+      if (contacts.length > 500) throw new Error("Upload up to 500 contacts at a time.");
+      const result = await api("/people/bulk-import", {
+        method: "POST",
+        body: JSON.stringify({ contacts }),
+      });
+      setPeople(await api("/people"));
+      setToast(`Roster imported: ${result.created} added, ${result.updated} updated, ${result.skipped} duplicate rows skipped.`);
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setImportBusy(false);
+    }
+  }
+
+  function downloadRosterTemplate() {
+    const csv = "name,email,role,group_name\nAditi Sharma,aditi@example.edu,Student,AMCA\nDr. Meera Nair,meera@example.edu,Teacher,Computer Science\n";
+    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "daybook-email-roster-template.csv";
+    link.click();
+    URL.revokeObjectURL(url);
   }
 
   function openPersonEditor(person = null) {
@@ -521,11 +602,12 @@ function App() {
             name: formData.get("name"),
             role,
             group_name: role === "Student" ? formData.get("cohort") : formData.get("group_name"),
-            phone: formData.get("phone"),
+            email: formData.get("email"),
+            email_opt_in: formData.get("email_opt_in") === "on",
           }),
         });
         setPeople(await api("/people"));
-        setToast(editingPerson ? "Person details updated." : "Person added. Verify their number before delivery.");
+        setToast(editingPerson ? "Person details updated." : "Person added to the email directory.");
       }
       setModal("");
       setEditingPeriod(null);
@@ -579,16 +661,16 @@ function App() {
     const lastHour = period.period_number + period.duration_hours - 1;
     return `Hour ${period.period_number}${lastHour > period.period_number ? `–${lastHour}` : ""}`;
   };
-  const smsPeriodLabel = (period) => {
+  const messagePeriodLabel = (period) => {
     const lastHour = period.period_number + period.duration_hours - 1;
     return `${period.period_number}${lastHour > period.period_number ? `-${lastHour}` : ""} Hr`;
   };
   const studentPreview = schedule
-    .map((period) => `${smsPeriodLabel(period)} ${period.subject}`).join("; ");
+    .map((period) => `${messagePeriodLabel(period)} ${period.subject}`).join("; ");
   const teacherPreview = [...cohorts.flatMap((item) => schedules[item][order - 1] || [])
     .reduce((assignments, period) => {
     const classes = assignments.get(period.teacher_name) || [];
-    classes.push(`${period.cohort} ${smsPeriodLabel(period)} ${period.subject} (${period.room})`);
+    classes.push(`${period.cohort} ${messagePeriodLabel(period)} ${period.subject} (${period.room})`);
     assignments.set(period.teacher_name, classes);
     return assignments;
   }, new Map())]
@@ -633,12 +715,12 @@ function App() {
             <div className="today-banner"><div className="banner-main"><span className="banner-icon"><CalendarDays size={22} /></span><div><div className="banner-kicker">TODAY'S SCHEDULE</div><h2>Day Order {String(currentOrder).padStart(2, "0")} <span className="banner-badge">Today</span></h2><p>{scheduledHours} timetable hours for the selected cohort.</p></div></div><div className="banner-current">Cycle advances automatically</div><div className="banner-decoration" /></div>
             <div className="stats-grid">
               <StatCard Icon={BookOpen} tone="lavender" value={scheduledHours} suffix="hours" caption="Timetable hours in this order" note="Across 6 day orders" />
-              <StatCard Icon={Users} tone="mint" value={students.length} caption="Active students" note={`${verifiedStudents} verified numbers`} />
-              <StatCard Icon={MessageCircle} tone="peach" value={teachers.length} suffix="teachers" caption="Faculty in directory" note={`${verifiedTeachers} verified numbers`} />
+              <StatCard Icon={Users} tone="mint" value={students.length} caption="Active students" note={`${verifiedStudents} email-enabled contacts`} />
+              <StatCard Icon={MessageCircle} tone="peach" value={teachers.length} suffix="teachers" caption="Faculty in directory" note={`${verifiedTeachers} email-enabled contacts`} />
             </div>
             <div className="dashboard-grid">
               <section className="panel schedule-panel"><div className="panel-heading"><div><div className="section-kicker">TIMETABLES</div><h3>Choose a schedule</h3></div><span className="status-pill"><span className="live-dot" />Day {order}</span></div><div className="timetable-cards"><button className="timetable-card student-card" onClick={() => navigate("student")}><span className="timetable-card-icon"><Users size={20} /></span><span className="timetable-card-copy"><strong>Student timetable</strong><small>Manage AMCA and NMCA schedules</small><span className="cohort-badges"><b>AMCA · 1st year</b><b>NMCA · 2nd year</b></span></span><ChevronRight size={17} /></button><button className="timetable-card faculty-card" onClick={() => navigate("faculty")}><span className="timetable-card-icon"><BookOpen size={20} /></span><span className="timetable-card-copy"><strong>Faculty timetable</strong><small>View teachers' classes by day and hour</small><span className="cohort-badges"><b>{teachers.length} faculty</b><b>Day Order {order}</b></span></span><ChevronRight size={17} /></button></div><div className="schedule-footer"><span><span className="legend-dot" />Six-hour day-order rotation</span></div></section>
-              <aside className="right-column"><section className="panel automation-panel"><div className="panel-heading"><div><div className="section-kicker">AUTOMATION</div><h3>Morning updates</h3></div><span className={`status-pill ${automation.daily_ready && settings.reminder_enabled ? "" : "paused"}`}><span className="live-dot" />{automationLabel}</span></div><p className="panel-description">Automatic student and teacher SMS in India Standard Time.</p><div className="automation-row"><span className="automation-icon"><Clock3 size={16} /></span><div className="automation-copy"><strong>Daily SMS reminder</strong><small>Every day at {formatTime(settings.reminder_time)}</small></div><label className="toggle"><input type="checkbox" checked={Boolean(automation.daily_enabled && settings.reminder_enabled)} disabled={!automation.daily_enabled} onChange={(event) => updateReminderEnabled(event.target.checked)} aria-label="Enable daily reminder" /><span /></label></div>{automation.last_run && <div className="automation-last-run">Latest: Day {automation.last_run.day_order} · {automation.last_run.sent_count}/{automation.last_run.recipient_count} accepted by provider{automation.last_run.failed_count ? ` · ${automation.last_run.failed_count} failed` : ""}</div>}<button className="button button-light button-full" onClick={() => navigate("messages")}>Review message <ChevronRight size={14} /></button></section>
+              <aside className="right-column"><section className="panel automation-panel"><div className="panel-heading"><div><div className="section-kicker">AUTOMATION</div><h3>Morning updates</h3></div><span className={`status-pill ${automation.daily_ready && settings.reminder_enabled ? "" : "paused"}`}><span className="live-dot" />{automationLabel}</span></div><p className="panel-description">Automatic student and teacher emails at the scheduled time in India Standard Time.</p><div className="automation-row"><span className="automation-icon"><Clock3 size={16} /></span><div className="automation-copy"><strong>Daily timetable email</strong><small>Daily at 7:00 AM IST</small></div><label className="toggle"><input type="checkbox" checked={Boolean(automation.daily_enabled && settings.reminder_enabled)} disabled={!automation.daily_enabled} onChange={(event) => updateReminderEnabled(event.target.checked)} aria-label="Enable daily reminder" /><span /></label></div>{automation.last_run && <div className="automation-last-run">Latest: Day {automation.last_run.day_order} · {automation.last_run.sent_count}/{automation.last_run.recipient_count} sent{automation.last_run.failed_count ? ` · ${automation.last_run.failed_count} failed` : ""}</div>}<button className="button button-light button-full" onClick={() => navigate("messages")}>Review message <ChevronRight size={14} /></button></section>
                 <section className="panel quick-message"><div className="panel-heading"><div><div className="section-kicker">QUICK ACTION</div><h3>Send an update</h3></div><span className="quick-sparkle"><Send size={15} /></span></div><p className="panel-description">Generate a one-time message preview.</p><div className="recipient-chips"><span className="recipient-chip"><span className="mini-avatar student">S</span> Students <strong>{students.length}</strong></span><span className="recipient-chip"><span className="mini-avatar teacher">T</span> Teachers <strong>{teachers.length}</strong></span></div><button className="button button-dark button-full" onClick={() => navigate("messages")}><Send size={14} /> Compose a message</button></section></aside>
             </div>
             <footer className="page-footer"><span>Registered Web Application · 2026</span><span>DAYBOOK <span className="footer-dot">•</span> 2026</span></footer>
@@ -648,25 +730,26 @@ function App() {
 
           {view === "faculty" && <section className="view"><div className="welcome-row"><div><div className="eyebrow">FACULTY TIMETABLE</div><h1>Faculty schedule</h1><p className="page-subtitle">Teacher assignments from both AMCA and NMCA for every day order.</p></div></div><section className="panel matrix-panel"><div className="panel-heading"><div><div className="section-kicker">ALL MCA FACULTY</div><h3>Classes by day and hour</h3></div><span className="status-pill"><span className="live-dot" />Today: Day {currentOrder}</span></div><p className="matrix-help">Use the Edit control on an assignment to change its teacher, class, subject, or room.</p><div className="table-wrap matrix-wrap"><table className="timetable-matrix faculty-matrix"><thead><tr><th>DAY</th>{[1, 2, 3, 4, 5, 6].map((hour) => <th key={hour}>{hour} Hr</th>)}</tr></thead><tbody>{dayOrders.map((day) => <FacultyMatrixRow key={day} order={day} schedules={cohorts.map((item) => ({ cohort: item, periods: schedules[item][day - 1] || [] }))} active={currentOrder === day} onSelect={() => changeOrder(day)} onEdit={(period, item) => openPeriodEditor(period, item, day)} />)}</tbody></table></div></section><div className="info-note"><span className="note-icon">i</span><span>Faculty edits update only the selected class in its AMCA or NMCA schedule.</span></div></section>}
 
-          {view === "people" && <section className="view"><div className="welcome-row"><div><div className="eyebrow">CAMPUS DIRECTORY</div><h1>Your people</h1><p className="page-subtitle">Manage contact details, verification and SMS opt-in for daily updates.</p></div><button className="button button-primary" onClick={() => openPersonEditor()}><Plus size={15} /> Add person</button></div><div className="people-summary"><PeopleStat Icon={Users} tone="mint" value={students.length} label="Students" /><PeopleStat Icon={BookOpen} tone="peach" value={teachers.length} label="Faculty members" /><PeopleStat Icon={Check} tone="verified" value={`${people.length ? Math.round((people.filter((person) => person.phone_verified && person.sms_consent && !person.is_sample).length / people.length) * 100) : 0}%`} label="SMS-ready contacts" /></div><section className="panel people-panel"><div className="people-toolbar"><div className="people-tabs">{["Everyone", "Students", "Teachers"].map((item) => <button key={item} className={`people-tab ${filter === item ? "active" : ""}`} onClick={() => setFilter(item)}>{item}<span>{item === "Everyone" ? people.length : item === "Students" ? students.length : teachers.length}</span></button>)}</div><label className="search-box"><Search size={14} /><input value={search} onChange={(event) => setSearch(event.target.value)} type="search" placeholder="Search name or class..." /></label></div><div className="table-wrap"><table className="schedule-table people-table"><thead><tr><th>NAME</th><th>ROLE</th><th>CLASS / DEPARTMENT</th><th>MOBILE</th><th>SMS STATUS</th><th>ACTIONS</th></tr></thead><tbody>{activePeople.length ? activePeople.map((person) => <tr key={person.id}><td><span className="person-name"><span className={`person-avatar ${person.role === "Teacher" ? "teacher-color" : ""}`}>{initials(person.name)}</span><strong>{person.name}</strong></span></td><td><span className={`role-pill ${person.role === "Teacher" ? "teacher-role" : ""}`}>{person.role}</span></td><td>{person.group_name}</td><td>{person.phone}</td><td><div className="sms-contact-status"><span className={person.is_sample ? "unverified-status" : person.phone_verified && person.sms_consent ? "verified-status" : "unverified-status"}>{person.is_sample ? "Demo contact" : person.phone_verified && person.sms_consent ? "Ready for SMS" : person.sms_consent ? "Verify number" : "Opt-in needed"}</span>{person.is_sample ? <small>Never sent</small> : <button type="button" className="sms-consent-button" onClick={() => updatePersonSmsStatus(person)}>{person.phone_verified && person.sms_consent ? "Pause SMS" : "Verify & enable"}</button>}</div></td><td><div className="people-actions"><button type="button" className="text-button" onClick={() => openPersonEditor(person)}><Pencil size={12} /> Edit</button><button type="button" className="text-button people-delete" disabled={busy} onClick={() => deletePerson(person)}><X size={12} /> Delete</button></div></td></tr>) : <tr><td colSpan="6" className="no-results">No matching people found.</td></tr>}</tbody></table></div></section></section>}
+          {view === "people" && <section className="view"><div className="welcome-row"><div><div className="eyebrow">CAMPUS DIRECTORY</div><h1>Your people</h1><p className="page-subtitle">Manage email addresses and email delivery preferences for daily updates.</p></div><div className="directory-actions"><input ref={rosterFileInput} type="file" accept=".csv,text/csv" hidden onChange={importRoster} /><button className="button button-light" disabled={importBusy} onClick={downloadRosterTemplate}><Mail size={14} /> CSV template</button><button className="button button-light" disabled={importBusy} onClick={() => rosterFileInput.current?.click()}><Upload size={14} /> {importBusy ? "Importing..." : "Bulk upload Gmail"}</button><button className="button button-primary" onClick={() => openPersonEditor()}><Plus size={15} /> Add person</button></div></div><div className="people-summary"><PeopleStat Icon={Users} tone="mint" value={students.length} label="Students" /><PeopleStat Icon={BookOpen} tone="peach" value={teachers.length} label="Faculty members" /><PeopleStat Icon={Check} tone="verified" value={`${people.length ? Math.round((people.filter((person) => person.email_opt_in && !person.is_sample).length / people.length) * 100) : 0}%`} label="Email-enabled contacts" /></div><section className="panel people-panel"><div className="people-toolbar"><div className="people-tabs">{["Everyone", "Students", "Teachers"].map((item) => <button key={item} className={`people-tab ${filter === item ? "active" : ""}`} onClick={() => setFilter(item)}>{item}<span>{item === "Everyone" ? people.length : item === "Students" ? students.length : teachers.length}</span></button>)}</div><label className="search-box"><Search size={14} /><input value={search} onChange={(event) => setSearch(event.target.value)} type="search" placeholder="Search name or class..." /></label></div><div className="table-wrap"><table className="schedule-table people-table"><thead><tr><th>NAME</th><th>ROLE</th><th>CLASS / DEPARTMENT</th><th>GMAIL ADDRESS</th><th>EMAIL STATUS</th><th>ACTIONS</th></tr></thead><tbody>{activePeople.length ? activePeople.map((person) => <tr key={person.id}><td><span className="person-name"><span className={`person-avatar ${person.role === "Teacher" ? "teacher-color" : ""}`}>{initials(person.name)}</span><strong>{person.name}</strong></span></td><td><span className={`role-pill ${person.role === "Teacher" ? "teacher-role" : ""}`}>{person.role}</span></td><td>{person.group_name}</td><td>{person.is_sample ? "Demo contact" : person.email}</td><td><div className="email-contact-status"><span className={person.is_sample || !person.email_opt_in ? "unverified-status" : "verified-status"}>{person.is_sample ? "Demo contact" : person.email_opt_in ? "Email enabled" : "Email paused"}</span>{!person.is_sample && <button type="button" className="email-toggle-button" onClick={() => updatePersonEmailStatus(person)}>{person.email_opt_in ? "Pause email" : "Enable email"}</button>}</div></td><td><div className="people-actions"><button type="button" className="text-button" onClick={() => openPersonEditor(person)}><Pencil size={12} /> Edit</button><button type="button" className="text-button people-delete" disabled={busy} onClick={() => deletePerson(person)}><X size={12} /> Delete</button></div></td></tr>) : <tr><td colSpan="6" className="no-results">No matching people found.</td></tr>}</tbody></table></div></section></section>}
 
           {view === "messages" && <section className="view">
             <div className="welcome-row"><div><div className="eyebrow">CAMPUS COMMUNICATION</div><h1>Morning messages</h1><p className="page-subtitle">Send one-time updates separately to students or faculty, or review the daily timetable reminders.</p></div><button className="button button-primary" disabled={busy} onClick={createPreview}><Send size={14} /> Generate preview</button></div>
             <section className="panel custom-message-panel">
-              <div className="panel-heading"><div><div className="section-kicker">CUSTOM SMS</div><h3>Write a custom message</h3></div><span className={`status-pill ${automation.custom_ready ? "" : "paused"}`}><span className="live-dot" />{automation.custom_ready ? "Ready to send" : "Sending unavailable"}</span></div>
-              <p className="panel-description">Choose one audience. Only active, non-demo contacts with verified numbers and SMS consent are included.</p>
+              <div className="panel-heading"><div><div className="section-kicker">CUSTOM EMAIL</div><h3>Write a custom message</h3></div><span className={`status-pill ${automation.custom_ready ? "" : "paused"}`}><span className="live-dot" />{automation.custom_ready ? "Ready to send" : "Sending unavailable"}</span></div>
+              <p className="panel-description">Choose one audience. Only active, non-demo contacts with email enabled are included.</p>
               <div className="custom-audience-picker" role="group" aria-label="Custom message audience">
                 <button type="button" className={customAudience === "students" ? "active" : ""} onClick={() => setCustomAudience("students")}><Users size={14} /> Students</button>
                 <button type="button" className={customAudience === "faculty" ? "active" : ""} onClick={() => setCustomAudience("faculty")}><BookOpen size={14} /> Faculty</button>
               </div>
               {customAudience === "students" && <label className="custom-cohort-picker">Student year<select value={customCohort} onChange={(event) => setCustomCohort(event.target.value)}><option value="AMCA">AMCA · 1st year</option><option value="NMCA">NMCA · 2nd year</option></select></label>}
-              <label className="custom-message-label">Message<textarea value={customMessage} onChange={(event) => setCustomMessage(event.target.value)} maxLength={1600} rows={4} placeholder="Write an announcement for the selected audience…" /></label>
-              <div className="custom-message-footer"><span>{customRecipients.length} eligible contact{customRecipients.length === 1 ? "" : "s"} · verified opt-in required</span><button className="button button-dark" type="button" disabled={!automation.custom_ready || customBusy || customRecipients.length === 0 || !customMessage.trim()} onClick={sendCustomMessage}><Send size={14} />{customBusy ? "Sending…" : automation.custom_ready ? `Send custom SMS to ${customAudience === "students" ? customCohort : "faculty"}` : "Sending unavailable"}</button></div>
+              <label className="custom-message-label">Subject<input value={customSubject} onChange={(event) => setCustomSubject(event.target.value)} maxLength={200} placeholder="e.g. Day Order timetable update" /></label>
+              <label className="custom-message-label">Message<textarea value={customMessage} onChange={(event) => setCustomMessage(event.target.value)} maxLength={10000} rows={4} placeholder="Write an announcement for the selected audience…" /></label>
+              <div className="custom-message-footer"><span>{customRecipients.length} email-enabled contact{customRecipients.length === 1 ? "" : "s"}{customRecipients.length > 100 ? " · limit is 100 per send" : ""}</span><button className="button button-dark" type="button" disabled={!automation.custom_ready || customBusy || customRecipients.length === 0 || customRecipients.length > 100 || !customSubject.trim() || !customMessage.trim()} onClick={sendCustomMessage}><Send size={14} />{customBusy ? "Sending…" : automation.custom_ready ? `Send custom email to ${customAudience === "students" ? customCohort : "faculty"}` : "Sending unavailable"}</button></div>
 
             </section>
-            <div className="message-layout"><section className="panel message-setup"><div className="panel-heading"><div><div className="section-kicker">TIMETABLE PREVIEWS</div><h3>Morning message preview</h3></div><span className={`status-pill ${automation.daily_ready && settings.reminder_enabled ? "" : "paused"}`}><span className="live-dot" />{!automation.daily_enabled ? "Not sent" : settings.reminder_enabled && automation.daily_ready ? "Enabled" : "Paused"}</span></div><p className="panel-description">A timetable reminder can be prepared each morning, tailored to the selected day order.</p><div className="message-schedule-card"><span className="automation-icon"><Clock3 size={16} /></span><div><strong>Scheduled for {formatTime(settings.reminder_time)}</strong><small>Daily · College local time</small></div><button className="text-button" onClick={() => navigate("settings")}>Edit schedule</button></div><div className="message-cohort-picker"><span>Student reminder for</span>{cohorts.map((item) => <button key={item} className={cohort === item ? "active" : ""} onClick={() => changeCohort(item)}>{item}</button>)}</div><div className="template-heading"><div><strong>{cohort} student message preview</strong><span>Day Order {String(order).padStart(2, "0")} · {cohort === "AMCA" ? "1st year" : "2nd year"}</span></div><span className="preview-tag">PREVIEW</span></div><div className="sms-preview"><strong>Good morning!</strong> {cohort} students, today is Day Order {String(order).padStart(2, "0")}. Your classes: {studentPreview || "No classes configured yet."}. Have a great day!</div><div className="template-heading teacher-template-heading"><div><strong>Teacher message preview</strong><span>Individual classes across AMCA and NMCA</span></div></div><div className="sms-preview teacher-preview">{teacherPreview || "No classes configured yet."}</div><div className="message-actions"><span className="demo-hint">Preview mode · Messages are not delivered</span><button className="button button-dark" disabled={busy} onClick={createPreview}><Send size={14} /> Save preview to history</button></div></section>
-              <aside className="panel message-info"><div className="section-kicker">RECIPIENTS</div><h3>Who gets notified?</h3><AudienceRow role="Student" count={verifiedStudentsByCohort[cohort]} detail={`${cohort} · verified ${cohort === "AMCA" ? "1st year" : "2nd year"} students`} /><AudienceRow role="Teacher" count={verifiedScheduledTeachers} detail="Verified faculty assigned classes on this day order" /></aside></div>
-            <section className="panel activity-panel"><div className="panel-heading"><div><div className="section-kicker">RECENT ACTIVITY</div><h3>Message history</h3></div><span className="demo-hint">Custom sends and saved previews</span></div>{messages.length ? <div className="activity-list">{messages.map((message) => { const body = message.audience === "faculty" ? message.teacher_message : message.student_message; const audienceLabel = message.audience === "students" ? `${message.cohort} students` : message.audience === "faculty" ? "Faculty" : `${message.cohort} timetable preview`; return <div key={message.id} className={`activity-item ${message.status === "failed" || message.status === "partial" ? "activity-item-failed" : ""}`}><span className="empty-icon"><Check size={15} /></span><span className="activity-copy"><strong>{audienceLabel} · {message.status === "preview" ? `Day Order ${String(message.day_order).padStart(2, "0")}` : message.status}</strong><small>{message.status === "preview" ? "Preview only · No SMS sent" : `${message.sent_count} accepted by provider of ${message.recipient_count} recipients · ${message.failed_count} failed · ${message.skipped_count} skipped`}</small>{body && <p>{body}</p>}</span><span className="activity-time">{new Date(`${message.created_at}Z`).toLocaleString()}</span></div>; })}</div> : <div className="empty-activity"><span className="empty-icon"><MessageCircle size={15} /></span><span><strong>No message activity yet</strong><small>Generate a timetable preview to add activity.</small></span></div>}</section>
+            <div className="message-layout"><section className="panel message-setup"><div className="panel-heading"><div><div className="section-kicker">TIMETABLE EMAILS</div><h3>Morning timetable email</h3></div><span className={`status-pill ${automation.daily_ready && settings.reminder_enabled ? "" : "paused"}`}><span className="live-dot" />{!automation.daily_enabled ? "Not configured" : settings.reminder_enabled && automation.daily_ready ? "Enabled" : "Paused"}</span></div><p className="panel-description">Personalized timetable emails are scheduled each morning at 7:00 AM India Standard Time.</p><div className="message-schedule-card"><span className="automation-icon"><Clock3 size={16} /></span><div><strong>Scheduled for 7:00 AM IST</strong><small>Daily · Asia/Kolkata</small></div><button className="text-button" onClick={() => navigate("settings")}>Edit settings</button></div><div className="message-cohort-picker"><span>Student reminder for</span>{cohorts.map((item) => <button key={item} className={cohort === item ? "active" : ""} onClick={() => changeCohort(item)}>{item}</button>)}</div><div className="template-heading"><div><strong>{cohort} student email preview</strong><span>Day Order {String(order).padStart(2, "0")} · {cohort === "AMCA" ? "1st year" : "2nd year"}</span></div><span className="preview-tag">PREVIEW</span></div><div className="email-preview"><strong>Good morning!</strong> {cohort} students, today is Day Order {String(order).padStart(2, "0")}. Your classes: {studentPreview || "No classes configured yet."}. Have a great day!</div><div className="template-heading teacher-template-heading"><div><strong>Teacher email preview</strong><span>Individual classes across AMCA and NMCA</span></div></div><div className="email-preview teacher-preview">{teacherPreview || "No classes configured yet."}</div><div className="message-actions"><span className="demo-hint">Preview only · No emails sent</span><button className="button button-dark" disabled={busy} onClick={createPreview}><Send size={14} /> Save preview to history</button></div></section>
+              <aside className="panel message-info"><div className="section-kicker">RECIPIENTS</div><h3>Who gets notified?</h3><AudienceRow role="Student" count={verifiedStudentsByCohort[cohort]} detail={`${cohort} · email-enabled ${cohort === "AMCA" ? "1st year" : "2nd year"} students`} /><AudienceRow role="Teacher" count={verifiedScheduledTeachers} detail="Email-enabled faculty assigned classes on this day order" /></aside></div>
+            <section className="panel activity-panel"><div className="panel-heading"><div><div className="section-kicker">RECENT ACTIVITY</div><h3>Message history</h3></div><span className="demo-hint">Custom sends and saved previews</span></div>{messages.length ? <div className="activity-list">{messages.map((message) => { const body = message.audience === "faculty" ? message.teacher_message : message.student_message; const audienceLabel = message.audience === "students" ? `${message.cohort} students` : message.audience === "faculty" ? "Faculty" : message.audience === "daily" ? "Daily timetable email" : `${message.cohort} timetable preview`; return <div key={message.id} className={`activity-item ${message.status === "failed" || message.status === "partial" ? "activity-item-failed" : ""}`}><span className="empty-icon"><Check size={15} /></span><span className="activity-copy"><strong>{audienceLabel} · {message.status === "preview" ? `Day Order ${String(message.day_order).padStart(2, "0")}` : message.status}</strong><small>{message.status === "preview" ? "Preview only - No email sent" : `\${message.sent_count} sent of \${message.recipient_count} recipients ? \${message.failed_count} failed`}</small>{body && <p>{body}</p>}</span><span className="activity-time">{new Date(`${message.created_at}Z`).toLocaleString()}</span></div>; })}</div> : <div className="empty-activity"><span className="empty-icon"><MessageCircle size={15} /></span><span><strong>No message activity yet</strong><small>Generate a timetable preview to add activity.</small></span></div>}</section>
           </section>}
 
           {view === "profile" && <section className="view">
@@ -691,11 +774,11 @@ function App() {
             </form>
           </section>}
 
-          {view === "settings" && <section className="view"><div className="welcome-row"><div><div className="eyebrow">HOD PREFERENCES</div><h1>Settings</h1><p className="page-subtitle">Configure the automatic six-day rotation and morning reminder.</p></div></div><form className="panel settings-panel" onSubmit={saveSettings}><div className="panel-heading"><div><div className="section-kicker">CAMPUS &amp; DAY-ORDER CYCLE</div><h3>Automatic schedule settings</h3></div><span className="status-pill"><span className="live-dot" />Today: Day {currentOrder}</span></div><div className="settings-grid"><label>College name<input name="college_name" defaultValue={settings.college_name} required minLength="2" /></label><label>Campus timezone<input value="India Standard Time (IST)" readOnly /></label><label>Cycle start date<input name="anchor_date" type="date" defaultValue={settings.anchor_date} required /></label><label>Day order on that date<select name="anchor_day_order" defaultValue={settings.anchor_day_order}>{dayOrders.map((day) => <option key={day} value={day}>Day Order {day}</option>)}</select></label><label>Morning SMS time<input name="reminder_time" type="time" defaultValue={settings.reminder_time} required /></label></div><p className="settings-explanation">Home shows the day order calculated for today from this start date. Use “Set selected order for today” to start the chosen order today; regular Save keeps the selected start date.</p><label className="settings-toggle"><input type="checkbox" name="reminder_enabled" checked={Boolean(automation.daily_enabled && settings.reminder_enabled)} disabled={!automation.daily_enabled} onChange={(event) => updateReminderEnabled(event.target.checked)} /> Enable the daily reminder schedule</label><div className="settings-footer"><span className="demo-hint">Changes save to the SQL database.</span><div className="settings-actions"><button className="button button-light" type="submit" name="cycle_action" value="today" disabled={busy}>Set selected order for today</button><button className="button button-primary" type="submit" disabled={busy}><Check size={15} /> Save changes</button></div></div></form><div className="info-note"><span className="note-icon">i</span><span>Rotation advances daily (including weekends). Timetable previews are available; SMS delivery is disabled until a provider is configured.</span></div></section>}
+          {view === "settings" && <section className="view"><div className="welcome-row"><div><div className="eyebrow">HOD PREFERENCES</div><h1>Settings</h1><p className="page-subtitle">Configure the automatic six-day rotation and morning reminder.</p></div></div><form className="panel settings-panel" onSubmit={saveSettings}><div className="panel-heading"><div><div className="section-kicker">CAMPUS &amp; DAY-ORDER CYCLE</div><h3>Automatic schedule settings</h3></div><span className="status-pill"><span className="live-dot" />Today: Day {currentOrder}</span></div><div className="settings-grid"><label>College name<input name="college_name" defaultValue={settings.college_name} required minLength="2" /></label><label>Campus timezone<input value="India Standard Time (IST)" readOnly /></label><label>Cycle start date<input name="anchor_date" type="date" defaultValue={settings.anchor_date} required /></label><label>Day order on that date<select name="anchor_day_order" defaultValue={settings.anchor_day_order}>{dayOrders.map((day) => <option key={day} value={day}>Day Order {day}</option>)}</select></label><label>Morning email time<input name="reminder_time" type="time" value="07:00" readOnly /></label></div><p className="settings-explanation">Home shows the day order calculated for today from this start date. Use “Set selected order for today” to start the chosen order today; regular Save keeps the selected start date.</p><label className="settings-toggle"><input type="checkbox" name="reminder_enabled" checked={Boolean(automation.daily_enabled && settings.reminder_enabled)} disabled={!automation.daily_enabled} onChange={(event) => updateReminderEnabled(event.target.checked)} /> Enable the daily reminder schedule</label><div className="settings-footer"><span className="demo-hint">Changes save to the SQL database.</span><div className="settings-actions"><button className="button button-light" type="submit" name="cycle_action" value="today" disabled={busy}>Set selected order for today</button><button className="button button-primary" type="submit" disabled={busy}><Check size={15} /> Save changes</button></div></div></form><div className="info-note"><span className="note-icon">i</span><span>Rotation advances daily, including weekends. Timetable reminders are emailed at 7:00 AM IST when Gmail is configured.</span></div></section>}
         </div>
       </main>
       {toast && <div className="toast" role="status">{toast}</div>}
-      {modal && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) { setModal(""); setEditingPeriod(null); setEditingPerson(null); } }}><form key={`${modal}-${editingPeriod?.id || editingPerson?.id || "new"}`} className="modal" onSubmit={submitModal}><button className="modal-close" type="button" onClick={() => { setModal(""); setEditingPeriod(null); setEditingPerson(null); }} aria-label="Close"><X size={18} /></button><span className="modal-symbol"><Sparkles size={20} /></span><h2>{modal === "period" ? `${editingPeriod ? "Edit" : "Add"} timetable entry` : `${editingPerson ? "Edit" : "Add"} a person`}</h2><p>{modal === "period" ? "Choose a course year, hour and duration. Labs can span multiple hours." : editingPerson ? "Update this person's directory details. Changing a phone number disables SMS until it is verified again." : "New contacts start blocked from SMS. Confirm their number and opt-in from the People list."}</p>{modal === "period" ? <div className="modal-fields"><label>Course year<select name="cohort" defaultValue={editingPeriod?.cohort || cohort}>{cohorts.map((item) => <option key={item} value={item}>{item} · {item === "AMCA" ? "1st year" : "2nd year"}</option>)}</select></label><label>Day order<select name="day_order" defaultValue={editingPeriod?.day_order || order}>{dayOrders.map((day) => <option key={day} value={day}>Day {day}</option>)}</select></label><label>Starting hour<select name="period_number" defaultValue={editingPeriod?.period_number || 1}>{[1, 2, 3, 4, 5, 6].map((hour) => <option key={hour} value={hour}>{hour} Hr</option>)}</select></label><label>Duration<select name="duration_hours" defaultValue={editingPeriod?.duration_hours || 1}>{[1, 2, 3, 4, 5, 6].map((hours) => <option key={hours} value={hours}>{hours} {hours === 1 ? "hour" : "hours"}</option>)}</select></label><label>Subject<input name="subject" defaultValue={editingPeriod?.subject || ""} placeholder="e.g. SE LAB" required /></label><label>Class<input name="class_name" defaultValue={editingPeriod?.class_name || cohort} required /></label><label>Teacher<select name="teacher_name" defaultValue={editingPeriod?.teacher_name || ""} required><option value="" disabled>Select a teacher</option>{editingPeriod?.teacher_name && !teachers.some((person) => person.name === editingPeriod.teacher_name) && <option value={editingPeriod.teacher_name}>{editingPeriod.teacher_name} · no longer in directory</option>}{teachers.map((teacher) => <option key={teacher.id} value={teacher.name}>{teacher.name}</option>)}<option value="Unassigned">Unassigned</option></select></label><label>Room<input name="room" defaultValue={editingPeriod?.room || ""} required /></label></div> : <div className="modal-fields"><label>Name<input name="name" defaultValue={editingPerson?.name || ""} minLength="2" required /></label><label>Role<select name="role" value={personRole} onChange={(event) => setPersonRole(event.target.value)}><option>Student</option><option>Teacher</option></select></label>{personRole === "Student" ? <label>Student cohort<select name="cohort" defaultValue={editingPerson?.role === "Student" ? editingPerson.group_name : "AMCA"} required><option value="AMCA">AMCA · 1st year</option><option value="NMCA">NMCA · 2nd year</option></select></label> : <label>Teacher department<input name="group_name" defaultValue={editingPerson?.role === "Teacher" ? editingPerson.group_name : "MCA"} required /></label>}<label>Mobile number<input name="phone" type="tel" defaultValue={editingPerson?.phone || ""} minLength="9" maxLength="16" pattern="\+[1-9][0-9]{7,14}" title="Use international format, such as +919876543210" placeholder="+919876543210" required /></label></div>}{modal === "period" && editingPeriod && <button className="button button-danger button-full" type="button" disabled={busy} onClick={deletePeriod}>Delete timetable entry</button>}<button className="button button-dark button-full" disabled={busy}>{busy ? "Saving…" : modal === "period" && editingPeriod ? "Save timetable changes" : modal === "person" && editingPerson ? "Save person changes" : "Save to database"}</button></form></div>}
+      {modal && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) { setModal(""); setEditingPeriod(null); setEditingPerson(null); } }}><form key={`${modal}-${editingPeriod?.id || editingPerson?.id || "new"}`} className="modal" onSubmit={submitModal}><button className="modal-close" type="button" onClick={() => { setModal(""); setEditingPeriod(null); setEditingPerson(null); }} aria-label="Close"><X size={18} /></button><span className="modal-symbol"><Sparkles size={20} /></span><h2>{modal === "period" ? `${editingPeriod ? "Edit" : "Add"} timetable entry` : `${editingPerson ? "Edit" : "Add"} a person`}</h2><p>{modal === "period" ? "Choose a course year, hour and duration. Labs can span multiple hours." : editingPerson ? "Update this person's directory details. Update the Gmail address used for timetable notices." : "New contacts are enabled for timetable emails by default. You can pause email delivery from the People list."}</p>{modal === "period" ? <div className="modal-fields"><label>Course year<select name="cohort" defaultValue={editingPeriod?.cohort || cohort}>{cohorts.map((item) => <option key={item} value={item}>{item} · {item === "AMCA" ? "1st year" : "2nd year"}</option>)}</select></label><label>Day order<select name="day_order" defaultValue={editingPeriod?.day_order || order}>{dayOrders.map((day) => <option key={day} value={day}>Day {day}</option>)}</select></label><label>Starting hour<select name="period_number" defaultValue={editingPeriod?.period_number || 1}>{[1, 2, 3, 4, 5, 6].map((hour) => <option key={hour} value={hour}>{hour} Hr</option>)}</select></label><label>Duration<select name="duration_hours" defaultValue={editingPeriod?.duration_hours || 1}>{[1, 2, 3, 4, 5, 6].map((hours) => <option key={hours} value={hours}>{hours} {hours === 1 ? "hour" : "hours"}</option>)}</select></label><label>Subject<input name="subject" defaultValue={editingPeriod?.subject || ""} placeholder="e.g. SE LAB" required /></label><label>Class<input name="class_name" defaultValue={editingPeriod?.class_name || cohort} required /></label><label>Teacher<select name="teacher_name" defaultValue={editingPeriod?.teacher_name || ""} required><option value="" disabled>Select a teacher</option>{editingPeriod?.teacher_name && !teachers.some((person) => person.name === editingPeriod.teacher_name) && <option value={editingPeriod.teacher_name}>{editingPeriod.teacher_name} · no longer in directory</option>}{teachers.map((teacher) => <option key={teacher.id} value={teacher.name}>{teacher.name}</option>)}<option value="Unassigned">Unassigned</option></select></label><label>Room<input name="room" defaultValue={editingPeriod?.room || ""} required /></label></div> : <div className="modal-fields"><label>Name<input name="name" defaultValue={editingPerson?.name || ""} minLength="2" required /></label><label>Role<select name="role" value={personRole} onChange={(event) => setPersonRole(event.target.value)}><option>Student</option><option>Teacher</option></select></label>{personRole === "Student" ? <label>Student cohort<select name="cohort" defaultValue={editingPerson?.role === "Student" ? editingPerson.group_name : "AMCA"} required><option value="AMCA">AMCA · 1st year</option><option value="NMCA">NMCA · 2nd year</option></select></label> : <label>Teacher department<input name="group_name" defaultValue={editingPerson?.role === "Teacher" ? editingPerson.group_name : "MCA"} required /></label>}<label>Gmail address<input name="email" type="email" defaultValue={editingPerson?.email || ""} maxLength="254" placeholder="student@gmail.com" required /></label><label className="settings-toggle"><input type="checkbox" name="email_opt_in" defaultChecked={editingPerson ? editingPerson.email_opt_in : true} /> Enable timetable emails</label></div>}{modal === "period" && editingPeriod && <button className="button button-danger button-full" type="button" disabled={busy} onClick={deletePeriod}>Delete timetable entry</button>}<button className="button button-dark button-full" disabled={busy}>{busy ? "Saving…" : modal === "period" && editingPeriod ? "Save timetable changes" : modal === "person" && editingPerson ? "Save person changes" : "Save to database"}</button></form></div>}
     </div>
   );
 }

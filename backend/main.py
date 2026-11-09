@@ -2,8 +2,10 @@ import hashlib
 import hmac
 import os
 import secrets
+import smtplib
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from email.utils import parseaddr
 
 from pathlib import Path
 from dotenv import load_dotenv
@@ -11,17 +13,25 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 import jwt
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import inspect, select, text
+from sqlalchemy import func, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .database import Base, SessionLocal, engine, get_db
-from .models import AppSetting, HodUser, MessageLog, Period, Person
-from .sms import COLLEGE_TIMEZONE, automation_status
+from .email_service import (
+    COLLEGE_TIMEZONE,
+    MAX_EMAILS_PER_SEND,
+    automation_status,
+    sender_address,
+    send_emails,
+)
+from .models import AppSetting, EmailAutomationRun, HodUser, MessageLog, Period, Person
 from .schemas import (
+    BulkImportResult,
+    BulkPersonImport,
     CustomMessageRequest,
     LoginRequest,
     LoginResponse,
@@ -32,7 +42,6 @@ from .schemas import (
     ProfileUpdate,
     PersonCreate,
     PersonOut,
-    PersonSmsStatus,
     PersonUpdate,
     PreviewRequest,
     PreviewResult,
@@ -69,16 +78,17 @@ LEGACY_SUBJECTS = {
     "Physics", "Programming Lab", "Database Systems", "Library",
 }
 SAMPLE_PEOPLE = [
-    ("Aditi Sharma", "Student", "AMCA", "+919876543210", False),
-    ("Rohan Mehta", "Student", "NMCA", "+919876543211", False),
-    ("Dr. Meera Nair", "Teacher", "Computer Science", "+919876543220", False),
-    ("Prof. K. Iyer", "Teacher", "Mathematics", "+919876543221", False),
-    ("Ananya Iqbal", "Student", "AMCA", "+919876543212", False),
-    ("Dr. S. Kumar", "Teacher", "Computer Science", "+919876543222", False),
-    ("Kavya Menon", "Student", "NMCA", "+919876543213", False),
-    ("Ms. R. Thomas", "Teacher", "Languages", "+919876543223", False),
+    ("Aditi Sharma", "Student", "AMCA", "student1@example.invalid"),
+    ("Rohan Mehta", "Student", "NMCA", "student2@example.invalid"),
+    ("Dr. Meera Nair", "Teacher", "Computer Science", "teacher1@example.invalid"),
+    ("Prof. K. Iyer", "Teacher", "Mathematics", "teacher2@example.invalid"),
+    ("Ananya Iqbal", "Student", "AMCA", "student3@example.invalid"),
+    ("Dr. S. Kumar", "Teacher", "Computer Science", "teacher3@example.invalid"),
+    ("Kavya Menon", "Student", "NMCA", "student4@example.invalid"),
+    ("Ms. R. Thomas", "Teacher", "Languages", "teacher4@example.invalid"),
 ]
-SAMPLE_PHONE_NUMBERS = {phone for _, _, _, phone, _ in SAMPLE_PEOPLE}
+SAMPLE_NAMES = {name for name, _, _, _ in SAMPLE_PEOPLE}
+EMAIL_PATTERN = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
 
 
 def hash_password(password: str) -> str:
@@ -137,6 +147,27 @@ def current_day_order(setting: AppSetting) -> int:
     today = datetime.now(COLLEGE_TIMEZONE).date()
     days_since_anchor = (today - setting.anchor_date).days
     return (setting.anchor_day_order - 1 + days_since_anchor) % 6 + 1
+
+
+def eligible_email_people(
+    db: Session,
+    role: str,
+    cohort: str | None = None,
+) -> list[Person]:
+    query = select(Person).where(
+        Person.role == role,
+        Person.is_active.is_(True),
+        Person.email_opt_in.is_(True),
+        Person.is_sample.is_(False),
+    )
+    if cohort:
+        query = query.where(Person.group_name == cohort)
+    return [
+        person
+        for person in db.scalars(query.order_by(Person.name)).all()
+        if person.email.lower().endswith((".invalid", ".local")) is False
+        and parseaddr(person.email)[1].lower() == person.email.lower()
+    ]
 
 
 def seed_hod_account(db: Session) -> None:
@@ -204,16 +235,15 @@ def seed_database() -> None:
             for entry in periods:
                 entry.class_name = "AMCA"
         if not db.scalar(select(Person.id).limit(1)):
-            for name, role, group_name, phone, verified in SAMPLE_PEOPLE:
+            for name, role, group_name, email in SAMPLE_PEOPLE:
                 db.add(
                     Person(
                         name=name,
                         role=role,
                         group_name=group_name,
-                        phone=phone,
+                        email=email,
                         is_active=True,
-                        phone_verified=False,
-                        sms_consent=False,
+                        email_opt_in=False,
                         is_sample=True,
                     )
                 )
@@ -227,10 +257,9 @@ def seed_database() -> None:
             for person in db.scalars(select(Person)).all():
                 if person.name in sample_cohorts:
                     person.group_name = sample_cohorts[person.name]
-        for sample in db.scalars(select(Person).where(Person.phone.in_(SAMPLE_PHONE_NUMBERS))).all():
+        for sample in db.scalars(select(Person).where(Person.name.in_(SAMPLE_NAMES))).all():
             sample.is_sample = True
-            sample.phone_verified = False
-            sample.sms_consent = False
+            sample.email_opt_in = False
         settings = db.scalar(select(AppSetting).limit(1))
         if settings is None:
             settings = AppSetting(
@@ -275,22 +304,32 @@ async def lifespan(_: FastAPI):
         ("failed_count", "INTEGER NOT NULL DEFAULT 0"),
         ("skipped_count", "INTEGER NOT NULL DEFAULT 0"),
         ("delivery_note", "TEXT"),
+        ("subject", "VARCHAR(200) NOT NULL DEFAULT ''"),
     ):
         if column not in message_columns:
             with engine.begin() as connection:
                 connection.execute(text(f"ALTER TABLE message_logs ADD COLUMN {column} {definition}"))
             message_columns.add(column)
     people_columns = {column["name"] for column in inspect(engine).get_columns("people")}
-    if "sms_consent" not in people_columns:
+    if "email" not in people_columns and "phone" in people_columns:
         with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE people RENAME COLUMN phone TO email"))
+            if engine.dialect.name == "postgresql":
+                connection.execute(text("ALTER TABLE people ALTER COLUMN email TYPE VARCHAR(254)"))
             connection.execute(
-                text("ALTER TABLE people ADD COLUMN sms_consent BOOLEAN NOT NULL DEFAULT FALSE")
+                text("UPDATE people SET email = 'legacy-' || id || '@example.invalid'")
             )
+        people_columns.remove("phone")
+        people_columns.add("email")
+    elif "email" not in people_columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE people ADD COLUMN email VARCHAR(254)"))
     if "is_sample" not in people_columns:
         with engine.begin() as connection:
-            connection.execute(
-                text("ALTER TABLE people ADD COLUMN is_sample BOOLEAN NOT NULL DEFAULT FALSE")
-            )
+            connection.execute(text("ALTER TABLE people ADD COLUMN is_sample BOOLEAN NOT NULL DEFAULT FALSE"))
+    if "email_opt_in" not in people_columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE people ADD COLUMN email_opt_in BOOLEAN NOT NULL DEFAULT FALSE"))
     seed_database()
     yield
 
@@ -473,7 +512,7 @@ def list_people(
         query = query.where(
             Person.name.ilike(pattern)
             | Person.group_name.ilike(pattern)
-            | Person.phone.ilike(pattern)
+            | Person.email.ilike(pattern)
         )
     return db.scalars(query).all()
 
@@ -481,14 +520,54 @@ def list_people(
 @api.post("/people", response_model=PersonOut, status_code=201)
 def add_person(payload: PersonCreate, db: Session = Depends(get_db)):
     person = Person(**payload.model_dump(), is_active=True)
+    person.email = person.email.strip().lower()
     db.add(person)
     try:
         db.commit()
     except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(status_code=409, detail="That mobile number is already registered.") from exc
+        raise HTTPException(status_code=409, detail="That email address is already registered.") from exc
     db.refresh(person)
     return person
+
+
+@api.post("/people/bulk-import", response_model=BulkImportResult)
+def bulk_import_people(payload: BulkPersonImport, db: Session = Depends(get_db)):
+    seen: set[str] = set()
+    created = 0
+    updated = 0
+    skipped = 0
+    for contact in payload.contacts:
+        email = contact.email.strip().lower()
+        if email in seen:
+            skipped += 1
+            continue
+        seen.add(email)
+        person = db.scalar(select(Person).where(func.lower(Person.email) == email))
+        if person is None:
+            db.add(Person(**{**contact.model_dump(), "email": email, "email_opt_in": True}, is_active=True))
+            created += 1
+            continue
+        previous_name = person.name
+        previous_role = person.role
+        person.name = contact.name.strip()
+        person.role = contact.role
+        person.group_name = contact.group_name.strip()
+        person.email_opt_in = True
+        person.is_active = True
+        person.is_sample = False
+        if previous_role == "Teacher" and (previous_name != person.name or person.role != "Teacher"):
+            db.query(Period).filter(Period.teacher_name == previous_name).update(
+                {Period.teacher_name: person.name if person.role == "Teacher" else "Unassigned"},
+                synchronize_session=False,
+            )
+        updated += 1
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="The roster could not be imported because email addresses must be unique.") from exc
+    return BulkImportResult(created=created, updated=updated, skipped=skipped)
 
 
 @api.put("/people/{person_id}", response_model=PersonOut)
@@ -498,12 +577,8 @@ def update_person(person_id: int, payload: PersonUpdate, db: Session = Depends(g
         raise HTTPException(status_code=404, detail="Active contact was not found.")
     previous_name = person.name
     previous_role = person.role
-    phone_changed = person.phone != payload.phone
     for key, value in payload.model_dump().items():
-        setattr(person, key, value)
-    if phone_changed:
-        person.phone_verified = False
-        person.sms_consent = False
+        setattr(person, key, value.strip().lower() if key == "email" else value)
     if previous_role == "Teacher" and (previous_name != person.name or person.role != "Teacher"):
         db.query(Period).filter(Period.teacher_name == previous_name).update(
             {Period.teacher_name: person.name if person.role == "Teacher" else "Unassigned"},
@@ -513,7 +588,7 @@ def update_person(person_id: int, payload: PersonUpdate, db: Session = Depends(g
         db.commit()
     except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(status_code=409, detail="That mobile number is already registered.") from exc
+        raise HTTPException(status_code=409, detail="That email address is already registered.") from exc
     db.refresh(person)
     return person
 
@@ -528,28 +603,9 @@ def delete_person(person_id: int, db: Session = Depends(get_db)):
             {Period.teacher_name: "Unassigned"}, synchronize_session=False
         )
     person.is_active = False
-    person.phone_verified = False
-    person.sms_consent = False
+    person.email_opt_in = False
     db.commit()
     return None
-
-
-@api.put("/people/{person_id}/sms-status", response_model=PersonOut)
-def update_person_sms_status(
-    person_id: int,
-    payload: PersonSmsStatus,
-    db: Session = Depends(get_db),
-):
-    person = db.get(Person, person_id)
-    if person is None or not person.is_active:
-        raise HTTPException(status_code=404, detail="Active contact was not found.")
-    if person.is_sample and (payload.phone_verified or payload.sms_consent):
-        raise HTTPException(status_code=409, detail="Demo contacts cannot be enabled for SMS.")
-    person.phone_verified = payload.phone_verified
-    person.sms_consent = payload.sms_consent
-    db.commit()
-    db.refresh(person)
-    return person
 
 
 @api.get("/settings", response_model=SettingOut)
@@ -593,16 +649,54 @@ def list_messages(db: Session = Depends(get_db)):
 
 
 @api.get("/messages/automation")
-def get_sms_automation_status(db: Session = Depends(get_db)):
+def get_email_automation_status(db: Session = Depends(get_db)):
     return automation_status(db)
 
 
 @api.post("/messages/custom", response_model=MessageOut, status_code=201)
-def send_custom_message(payload: CustomMessageRequest):
-    raise HTTPException(
-        status_code=503,
-        detail="SMS sending is disabled because no SMS provider is configured. No message was sent.",
+def send_custom_message(payload: CustomMessageRequest, db: Session = Depends(get_db)):
+    if sender_address() is None:
+        raise HTTPException(status_code=503, detail="Gmail sending is not configured.")
+    if payload.audience == "students" and payload.cohort is None:
+        raise HTTPException(status_code=422, detail="Select a student cohort.")
+    recipients = eligible_email_people(
+        db,
+        "Student" if payload.audience == "students" else "Teacher",
+        payload.cohort if payload.audience == "students" else None,
     )
+    if len(recipients) > MAX_EMAILS_PER_SEND:
+        raise HTTPException(status_code=413, detail=f"Limit each email send to {MAX_EMAILS_PER_SEND} recipients.")
+    sent = 0
+    failed = 0
+    if recipients:
+        try:
+            sent, failed = send_emails(
+                (person, payload.subject, payload.message)
+                for person in recipients
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except (smtplib.SMTPException, OSError) as exc:
+            raise HTTPException(status_code=502, detail="Gmail could not complete the send. Check Gmail App Password and SMTP access.") from exc
+    setting = db.scalar(select(AppSetting).limit(1))
+    log = MessageLog(
+        day_order=current_day_order(setting) if setting else 1,
+        cohort=payload.cohort or "AMCA",
+        audience=payload.audience,
+        recipient_count=len(recipients),
+        sent_count=sent,
+        failed_count=failed,
+        skipped_count=0,
+        delivery_note="Sent with Gmail." if failed == 0 else f"{failed} email(s) were rejected.",
+        status="sent" if sent and not failed else "partial" if sent else "failed" if failed else "no_recipients",
+        subject=payload.subject,
+        student_message=payload.message if payload.audience == "students" else "",
+        teacher_message=payload.message if payload.audience == "faculty" else "",
+    )
+    db.add(log)
+    db.commit()
+    db.refresh(log)
+    return log
 
 
 @api.post("/messages/preview", response_model=PreviewResult, status_code=201)
@@ -616,28 +710,7 @@ def create_message_preview(payload: PreviewRequest, db: Session = Depends(get_db
     ).all()
     if not schedule:
         raise HTTPException(status_code=404, detail="No timetable has been configured for that day order.")
-    from sqlalchemy import func
-
-    # Preview recipient totals include only active records with verified numbers.
-    student_count = db.scalar(
-        select(func.count(Person.id)).where(
-            Person.role == "Student",
-            Person.is_active.is_(True),
-            Person.phone_verified.is_(True),
-            Person.sms_consent.is_(True),
-            Person.is_sample.is_(False),
-            Person.group_name == payload.cohort,
-        )
-    ) or 0
-    teacher_count = db.scalar(
-        select(func.count(Person.id)).where(
-            Person.role == "Teacher",
-            Person.is_active.is_(True),
-            Person.phone_verified.is_(True),
-            Person.sms_consent.is_(True),
-            Person.is_sample.is_(False),
-        )
-    ) or 0
+    student_count = len(eligible_email_people(db, "Student", payload.cohort))
     student_classes = "; ".join(
         f"{period.period_number}"
         f"{f'-{period.period_number + period.duration_hours - 1}' if period.duration_hours > 1 else ''} Hr "
@@ -656,17 +729,23 @@ def create_message_preview(payload: PreviewRequest, db: Session = Depends(get_db
             f"{f'-{period.period_number + period.duration_hours - 1}' if period.duration_hours > 1 else ''} Hr: "
             f"{period.class_name}, {period.subject} ({period.room})"
         )
+    eligible_teachers = eligible_email_people(db, "Teacher")
+    scheduled_teachers = [
+        teacher for teacher in eligible_teachers
+        if teacher.name in assignments_by_teacher
+    ]
     teacher_messages = " | ".join(
-        f"Good morning, {teacher_name}. Day Order {payload.day_order:02d} classes: "
-        f"{', '.join(assignments)}."
-        for teacher_name, assignments in assignments_by_teacher.items()
+        f"Good morning, {teacher.name}. Day Order {payload.day_order:02d} classes: "
+        f"{', '.join(assignments_by_teacher[teacher.name])}."
+        for teacher in scheduled_teachers
     )
     log = MessageLog(
         day_order=payload.day_order,
         cohort=payload.cohort,
         audience="students_and_teachers",
-        recipient_count=student_count + teacher_count,
+        recipient_count=student_count + len(scheduled_teachers),
         status="preview",
+        subject=f"Day Order {payload.day_order:02d} timetable · {payload.cohort}",
         student_message=f"Good morning! Today is Day Order {payload.day_order:02d}. Your classes: {student_classes}. Have a great day!",
         teacher_message=teacher_messages,
     )
@@ -675,8 +754,118 @@ def create_message_preview(payload: PreviewRequest, db: Session = Depends(get_db
     db.refresh(log)
     return PreviewResult(
         message=log,
-        delivery_note="Preview saved only. No SMS was sent.",
+        delivery_note="Preview saved only. No email was sent.",
     )
 
 
 app.include_router(api)
+
+
+@app.get("/api/cron/daily-email")
+def send_daily_email(
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    cron_secret = os.getenv("CRON_SECRET", "")
+    if not cron_secret:
+        raise HTTPException(status_code=503, detail="Daily email cron is not configured.")
+    if not authorization or not hmac.compare_digest(authorization, f"Bearer {cron_secret}"):
+        raise HTTPException(status_code=401, detail="Invalid cron authorization.")
+    if sender_address() is None:
+        raise HTTPException(status_code=503, detail="Gmail sending is not configured.")
+    setting = db.scalar(select(AppSetting).limit(1))
+    if setting is None:
+        raise HTTPException(status_code=500, detail="Application settings have not been initialized.")
+    if not setting.reminder_enabled:
+        return {"status": "paused"}
+
+    today = datetime.now(COLLEGE_TIMEZONE).date()
+    existing_run = db.scalar(select(EmailAutomationRun).where(EmailAutomationRun.run_date == today))
+    if existing_run:
+        return {"status": "already_sent", "day_order": existing_run.day_order}
+
+    order = current_day_order(setting)
+    students_by_cohort = {
+        cohort: eligible_email_people(db, "Student", cohort)
+        for cohort in ("AMCA", "NMCA")
+    }
+    faculty = eligible_email_people(db, "Teacher")
+    periods = db.scalars(
+        select(Period)
+        .where(Period.day_order == order)
+        .order_by(Period.cohort, Period.period_number)
+    ).all()
+    faculty_classes: dict[str, list[str]] = {}
+    for period in periods:
+        faculty_classes.setdefault(period.teacher_name.strip().lower(), []).append(
+            f"{period.cohort}, hour {period.period_number}"
+            f"{f'-{period.period_number + period.duration_hours - 1}' if period.duration_hours > 1 else ''}: "
+            f"{period.subject} ({period.room})"
+        )
+
+    messages: list[tuple[Person, str, str]] = []
+    student_summaries: list[str] = []
+    for cohort, recipients in students_by_cohort.items():
+        classes = [
+            f"{period.period_number}"
+            f"{f'-{period.period_number + period.duration_hours - 1}' if period.duration_hours > 1 else ''} Hr {period.subject}"
+            for period in periods
+            if period.cohort == cohort
+        ]
+        body = f"Good morning! Today is Day Order {order:02d}. Your classes: {'; '.join(classes)}. Have a great day!"
+        student_summaries.append(f"{cohort}: {', '.join(classes)}")
+        messages.extend((person, f"Day Order {order:02d} timetable · {cohort}", body) for person in recipients)
+
+    teacher_count = 0
+    for teacher in faculty:
+        classes = faculty_classes.get(teacher.name.strip().lower())
+        if classes:
+            messages.append((
+                teacher,
+                f"Your classes for Day Order {order:02d}",
+                f"Good morning, {teacher.name}. Your classes: {'; '.join(classes)}.",
+            ))
+            teacher_count += 1
+    if len(messages) > MAX_EMAILS_PER_SEND:
+        raise HTTPException(status_code=413, detail=f"Daily email is limited to {MAX_EMAILS_PER_SEND} recipients.")
+
+    run = EmailAutomationRun(
+        run_date=today,
+        day_order=order,
+        status="sending",
+        recipient_count=len(messages),
+    )
+    db.add(run)
+    db.commit()
+    sent = 0
+    failed = 0
+    try:
+        sent, failed = send_emails(messages)
+    except (RuntimeError, smtplib.SMTPException, OSError) as exc:
+        run.status = "failed"
+        run.completed_at = datetime.utcnow()
+        db.commit()
+        raise HTTPException(status_code=502, detail=f"Daily Gmail delivery failed: {exc}") from exc
+
+    run.sent_count = sent
+    run.failed_count = failed
+    run.status = "sent" if sent and not failed else "partial" if sent else "failed" if failed else "no_recipients"
+    run.completed_at = datetime.utcnow()
+    db.add(
+        MessageLog(
+            day_order=order,
+            cohort="AMCA",
+            audience="daily",
+            recipient_count=len(messages),
+            sent_count=sent,
+            failed_count=failed,
+            skipped_count=0,
+            delivery_note="Daily Gmail timetable notice.",
+            status=run.status,
+            subject=f"Day Order {order:02d} morning timetable",
+            student_message="; ".join(student_summaries),
+            teacher_message=f"Personalized classes delivered to {teacher_count} faculty member(s).",
+        )
+    )
+    db.commit()
+    return {"status": run.status, "day_order": order, "sent_count": sent, "failed_count": failed}
