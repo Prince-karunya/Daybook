@@ -47,6 +47,7 @@ from .schemas import (
     PreviewResult,
     SettingOut,
     SettingUpdate,
+    TimetableSendRequest,
 )
 
 HOD_EMAIL = os.getenv("DAYBOOK_HOD_EMAIL", "hod@daybook.local").strip().lower()
@@ -692,6 +693,94 @@ def send_custom_message(payload: CustomMessageRequest, db: Session = Depends(get
         subject=payload.subject,
         student_message=payload.message if payload.audience == "students" else "",
         teacher_message=payload.message if payload.audience == "faculty" else "",
+    )
+    db.add(log)
+    db.commit()
+    db.refresh(log)
+    return log
+
+
+@api.post("/messages/timetable/send", response_model=MessageOut, status_code=201)
+def send_timetable_template(payload: TimetableSendRequest, db: Session = Depends(get_db)):
+    if sender_address() is None:
+        raise HTTPException(status_code=503, detail="Gmail sending is not configured.")
+
+    periods = db.scalars(
+        select(Period)
+        .where(Period.day_order == payload.day_order)
+        .order_by(Period.cohort, Period.period_number)
+    ).all()
+    messages: list[tuple[Person, str, str]] = []
+    student_message = ""
+    teacher_message = ""
+
+    if payload.audience == "students":
+        recipients = eligible_email_people(db, "Student", payload.cohort)
+        classes = [
+            f"{period.period_number}"
+            f"{f'-{period.period_number + period.duration_hours - 1}' if period.duration_hours > 1 else ''} Hr "
+            f"{period.subject}"
+            for period in periods
+            if period.cohort == payload.cohort
+        ]
+        class_list = "; ".join(classes) if classes else "No classes are scheduled"
+        student_message = (
+            f"Good morning! {payload.cohort} students, today is Day Order {payload.day_order:02d}. "
+            f"Your classes: {class_list}. Have a great day!"
+        )
+        subject = f"Day Order {payload.day_order:02d}"
+        messages = [(person, subject, student_message) for person in recipients]
+    else:
+        faculty = eligible_email_people(db, "Teacher")
+        classes_by_teacher: dict[str, list[str]] = {}
+        for period in periods:
+            classes_by_teacher.setdefault(period.teacher_name.strip().lower(), []).append(
+                f"{period.cohort}, hour {period.period_number}"
+                f"{f'-{period.period_number + period.duration_hours - 1}' if period.duration_hours > 1 else ''}: "
+                f"{period.class_name}, {period.subject} ({period.room})"
+            )
+        for teacher in faculty:
+            classes = classes_by_teacher.get(teacher.name.strip().lower())
+            if classes:
+                messages.append((
+                    teacher,
+                    f"Day Order {payload.day_order:02d}",
+                    f"Good morning, {teacher.name}! Today is Day Order {payload.day_order:02d}. "
+                    f"Your classes: {'; '.join(classes)}.",
+                ))
+        subject = f"Day Order {payload.day_order:02d}"
+        teacher_message = f"Personalized class schedules for Day Order {payload.day_order:02d}."
+
+    if len(messages) > MAX_EMAILS_PER_SEND:
+        raise HTTPException(status_code=413, detail=f"Limit each email send to {MAX_EMAILS_PER_SEND} recipients.")
+
+    sent = 0
+    failed = 0
+    if messages:
+        try:
+            sent, failed = send_emails(messages)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except (smtplib.SMTPException, OSError) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="Gmail could not complete the send. Check Gmail App Password and SMTP access.",
+            ) from exc
+
+    status = "sent" if sent and not failed else "partial" if sent else "failed" if failed else "no_recipients"
+    log = MessageLog(
+        day_order=payload.day_order,
+        cohort=payload.cohort,
+        audience=payload.audience,
+        recipient_count=len(messages),
+        sent_count=sent,
+        failed_count=failed,
+        skipped_count=0,
+        delivery_note="Sent with Gmail." if failed == 0 else f"{failed} email(s) were rejected.",
+        status=status,
+        subject=subject,
+        student_message=student_message,
+        teacher_message=teacher_message,
     )
     db.add(log)
     db.commit()

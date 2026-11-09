@@ -46,7 +46,7 @@ Vercel deployments refuse to start the API without `DATABASE_URL` in production 
 
 ## Email notices
 
-The **Email activity** page supports custom messages to an AMCA/NMCA cohort or faculty, preview saving, and personalized daily timetable emails. Gmail sending uses SMTP with a Google App Password. Configure `GMAIL_ADDRESS`, `GMAIL_APP_PASSWORD`, and `CRON_SECRET` in Vercel Production; never commit them to source control. The Vercel cron sends daily at 7:00 AM India Standard Time and sends at most 100 messages per run. Custom sends are also limited to 100 recipients per request.
+The **Email activity** page supports custom messages to an AMCA/NMCA cohort or faculty, preview saving, and personalized daily timetable emails. The timetable section can immediately send the selected day-order template to a student cohort or send each scheduled teacher their individual classes. Gmail sending uses SMTP with a Google App Password. Configure `GMAIL_ADDRESS`, `GMAIL_APP_PASSWORD`, and `CRON_SECRET` in Vercel Production; never commit them to source control. The Vercel cron sends daily at 7:00 AM India Standard Time and sends at most 100 messages per run. Custom sends are also limited to 100 recipients per request.
 
 Upload a CSV with the header `name,email,role,group_name`; `role` must be `Student` or `Teacher`, and students should use the `AMCA` or `NMCA` group. Imports can create contacts or update matching email addresses, and imported contacts are enabled for timetable emails. The People page provides a downloadable CSV template. Demo contacts are never emailed.
 

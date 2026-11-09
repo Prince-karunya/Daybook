@@ -137,6 +137,12 @@ class CustomMessageRequest(BaseModel):
     message: str = Field(min_length=1, max_length=10000)
 
 
+class TimetableSendRequest(BaseModel):
+    day_order: int = Field(ge=1, le=6)
+    audience: str = Field(pattern=r"^(students|faculty)$")
+    cohort: str = Field(pattern=r"^(AMCA|NMCA)$")
+
+
 class BulkImportResult(BaseModel):
     created: int
     updated: int

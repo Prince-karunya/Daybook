@@ -164,6 +164,7 @@ function App() {
   const rosterFileInput = useRef(null);
   const [modal, setModal] = useState("");
   const [toast, setToast] = useState("");
+  const [emailSent, setEmailSent] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [mobileMenu, setMobileMenu] = useState(false);
@@ -482,13 +483,43 @@ function App() {
         }),
       });
       setMessages(await api("/messages"));
-      setToast(
-        result.status === "no_recipients"
+      if (result.sent_count > 0) {
+        setEmailSent(result);
+      } else {
+        setToast(
+          result.status === "no_recipients"
+            ? "No active, email-enabled recipients were available."
+            : `Gmail could not deliver to ${result.failed_count} recipients. ${result.delivery_note || "Check message history for details."}`,
+        );
+      }
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setCustomBusy(false);
+    }
+  }
+
+  async function sendTimetableTemplate(audience) {
+    const recipientCount = audience === "students"
+      ? verifiedStudentsByCohort[cohort]
+      : verifiedScheduledTeachers;
+    if (!automation.custom_ready || recipientCount === 0 || customBusy) return;
+    const audienceLabel = audience === "students" ? `${cohort} students` : "scheduled faculty";
+    if (!window.confirm(`Send the Day Order ${String(order).padStart(2, "0")} timetable template to ${recipientCount} ${audienceLabel}?`)) return;
+    setCustomBusy(true);
+    try {
+      const result = await api("/messages/timetable/send", {
+        method: "POST",
+        body: JSON.stringify({ day_order: order, audience, cohort }),
+      });
+      setMessages(await api("/messages"));
+      if (result.sent_count > 0) {
+        setEmailSent(result);
+      } else {
+        setToast(result.status === "no_recipients"
           ? "No active, email-enabled recipients were available."
-          : result.failed_count && result.sent_count === 0
-            ? `Gmail could not deliver to ${result.failed_count} recipients. ${result.delivery_note || "Check message history for details."}`
-            : `Gmail sent to ${result.sent_count} of ${result.recipient_count} recipients${result.failed_count ? `; ${result.failed_count} failed` : ""}.${result.delivery_note ? ` ${result.delivery_note}` : ""}`,
-      );
+          : `Gmail could not deliver to ${result.failed_count} recipients. ${result.delivery_note || "Check message history for details."}`);
+      }
     } catch (requestError) {
       setError(requestError.message);
     } finally {
@@ -670,11 +701,11 @@ function App() {
   const teacherPreview = [...cohorts.flatMap((item) => schedules[item][order - 1] || [])
     .reduce((assignments, period) => {
     const classes = assignments.get(period.teacher_name) || [];
-    classes.push(`${period.cohort} ${messagePeriodLabel(period)} ${period.subject} (${period.room})`);
+    classes.push(`${period.cohort}, ${messagePeriodLabel(period)}: ${period.class_name}, ${period.subject} (${period.room})`);
     assignments.set(period.teacher_name, classes);
     return assignments;
   }, new Map())]
-    .map(([teacher, classes]) => `Good morning, ${teacher}. Your classes: ${classes.join("; ")}.`)
+    .map(([teacher, classes]) => `Good morning, ${teacher}! Today is Day Order ${String(order).padStart(2, "0")}. Your classes: ${classes.join("; ")}.`)
     .join(" ");
 
   if (!token || !hod) {
@@ -747,7 +778,7 @@ function App() {
               <div className="custom-message-footer"><span>{customRecipients.length} email-enabled contact{customRecipients.length === 1 ? "" : "s"}{customRecipients.length > 100 ? " · limit is 100 per send" : ""}</span><button className="button button-dark" type="button" disabled={!automation.custom_ready || customBusy || customRecipients.length === 0 || customRecipients.length > 100 || !customSubject.trim() || !customMessage.trim()} onClick={sendCustomMessage}><Send size={14} />{customBusy ? "Sending…" : automation.custom_ready ? `Send custom email to ${customAudience === "students" ? customCohort : "faculty"}` : "Sending unavailable"}</button></div>
 
             </section>
-            <div className="message-layout"><section className="panel message-setup"><div className="panel-heading"><div><div className="section-kicker">TIMETABLE EMAILS</div><h3>Morning timetable email</h3></div><span className={`status-pill ${automation.daily_ready && settings.reminder_enabled ? "" : "paused"}`}><span className="live-dot" />{!automation.daily_enabled ? "Not configured" : settings.reminder_enabled && automation.daily_ready ? "Enabled" : "Paused"}</span></div><p className="panel-description">Personalized timetable emails are scheduled each morning at 7:00 AM India Standard Time.</p><div className="message-schedule-card"><span className="automation-icon"><Clock3 size={16} /></span><div><strong>Scheduled for 7:00 AM IST</strong><small>Daily · Asia/Kolkata</small></div><button className="text-button" onClick={() => navigate("settings")}>Edit settings</button></div><div className="message-cohort-picker"><span>Student reminder for</span>{cohorts.map((item) => <button key={item} className={cohort === item ? "active" : ""} onClick={() => changeCohort(item)}>{item}</button>)}</div><div className="template-heading"><div><strong>{cohort} student email preview</strong><span>Day Order {String(order).padStart(2, "0")} · {cohort === "AMCA" ? "1st year" : "2nd year"}</span></div><span className="preview-tag">PREVIEW</span></div><div className="email-preview"><strong>Good morning!</strong> {cohort} students, today is Day Order {String(order).padStart(2, "0")}. Your classes: {studentPreview || "No classes configured yet."}. Have a great day!</div><div className="template-heading teacher-template-heading"><div><strong>Teacher email preview</strong><span>Individual classes across AMCA and NMCA</span></div></div><div className="email-preview teacher-preview">{teacherPreview || "No classes configured yet."}</div><div className="message-actions"><span className="demo-hint">Preview only · No emails sent</span><button className="button button-dark" disabled={busy} onClick={createPreview}><Send size={14} /> Save preview to history</button></div></section>
+            <div className="message-layout"><section className="panel message-setup"><div className="panel-heading"><div><div className="section-kicker">TIMETABLE EMAILS</div><h3>Morning timetable email</h3></div><span className={`status-pill ${automation.daily_ready && settings.reminder_enabled ? "" : "paused"}`}><span className="live-dot" />{!automation.daily_enabled ? "Not configured" : settings.reminder_enabled && automation.daily_ready ? "Enabled" : "Paused"}</span></div><p className="panel-description">Personalized timetable emails are scheduled each morning at 7:00 AM India Standard Time.</p><div className="message-schedule-card"><span className="automation-icon"><Clock3 size={16} /></span><div><strong>Scheduled for 7:00 AM IST</strong><small>Daily · Asia/Kolkata</small></div><button className="text-button" onClick={() => navigate("settings")}>Edit settings</button></div><div className="message-cohort-picker"><label>Day order<select aria-label="Template day order" value={order} onChange={(event) => changeOrder(Number(event.target.value))}>{dayOrders.map((day) => <option key={day} value={day}>Day Order {String(day).padStart(2, "0")}</option>)}</select></label><span>Student reminder for</span>{cohorts.map((item) => <button key={item} className={cohort === item ? "active" : ""} onClick={() => changeCohort(item)}>{item}</button>)}</div>            <div className="template-heading"><div><strong>{cohort} student email preview</strong><span>Subject: Day Order {String(order).padStart(2, "0")} · {cohort} · {cohort === "AMCA" ? "1st year" : "2nd year"}</span></div><span className="preview-tag">PREVIEW</span></div><div className="email-preview"><strong>Good morning!</strong> {cohort} students, today is Day Order {String(order).padStart(2, "0")}. Your classes: {studentPreview || "No classes configured yet."}. Have a great day!</div><div className="template-heading teacher-template-heading"><div><strong>Teacher email preview</strong><span>Subject: Day Order {String(order).padStart(2, "0")} · Individual classes across AMCA and NMCA</span></div></div><div className="email-preview teacher-preview">{teacherPreview || "No classes configured yet."}</div><div className="message-actions"><span className="demo-hint">Preview only · No emails sent</span><div className="message-send-actions"><button className="button button-light" disabled={busy || customBusy || !automation.custom_ready || verifiedStudentsByCohort[cohort] === 0} onClick={() => sendTimetableTemplate("students")}><Send size={14} /> Send {cohort} student template</button><button className="button button-dark" disabled={busy || customBusy || !automation.custom_ready || verifiedScheduledTeachers === 0} onClick={() => sendTimetableTemplate("faculty")}><Send size={14} /> Send faculty templates</button><button className="button button-light" disabled={busy || customBusy} onClick={createPreview}><Send size={14} /> Save preview to history</button></div></div></section>
               <aside className="panel message-info"><div className="section-kicker">RECIPIENTS</div><h3>Who gets notified?</h3><AudienceRow role="Student" count={verifiedStudentsByCohort[cohort]} detail={`${cohort} · email-enabled ${cohort === "AMCA" ? "1st year" : "2nd year"} students`} /><AudienceRow role="Teacher" count={verifiedScheduledTeachers} detail="Email-enabled faculty assigned classes on this day order" /></aside></div>
             <section className="panel activity-panel"><div className="panel-heading"><div><div className="section-kicker">RECENT ACTIVITY</div><h3>Message history</h3></div><span className="demo-hint">Custom sends and saved previews</span></div>{messages.length ? <div className="activity-list">{messages.map((message) => { const body = message.audience === "faculty" ? message.teacher_message : message.student_message; const audienceLabel = message.audience === "students" ? `${message.cohort} students` : message.audience === "faculty" ? "Faculty" : message.audience === "daily" ? "Daily timetable email" : `${message.cohort} timetable preview`; return <div key={message.id} className={`activity-item ${message.status === "failed" || message.status === "partial" ? "activity-item-failed" : ""}`}><span className="empty-icon"><Check size={15} /></span><span className="activity-copy"><strong>{audienceLabel} · {message.status === "preview" ? `Day Order ${String(message.day_order).padStart(2, "0")}` : message.status}</strong><small>{message.status === "preview" ? "Preview only - No email sent" : `\${message.sent_count} sent of \${message.recipient_count} recipients ? \${message.failed_count} failed`}</small>{body && <p>{body}</p>}</span><span className="activity-time">{new Date(`${message.created_at}Z`).toLocaleString()}</span></div>; })}</div> : <div className="empty-activity"><span className="empty-icon"><MessageCircle size={15} /></span><span><strong>No message activity yet</strong><small>Generate a timetable preview to add activity.</small></span></div>}</section>
           </section>}
@@ -778,6 +809,15 @@ function App() {
         </div>
       </main>
       {toast && <div className="toast" role="status">{toast}</div>}
+      {emailSent && <div className="modal-backdrop email-sent-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setEmailSent(null); }}>
+        <section className="modal email-sent-modal" role="dialog" aria-modal="true" aria-labelledby="email-sent-title">
+          <button className="modal-close" type="button" onClick={() => setEmailSent(null)} aria-label="Close"><X size={18} /></button>
+          <span className="modal-symbol"><Mail size={20} /></span>
+          <h2 id="email-sent-title">{emailSent.failed_count ? "Email partially sent" : "Email sent"}</h2>
+          <p>Gmail accepted {emailSent.sent_count} of {emailSent.recipient_count} emails for delivery.{emailSent.failed_count ? ` ${emailSent.failed_count} could not be delivered.` : ""}</p>
+          <button className="button button-dark button-full" type="button" onClick={() => setEmailSent(null)}>Done</button>
+        </section>
+      </div>}
       {modal && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) { setModal(""); setEditingPeriod(null); setEditingPerson(null); } }}><form key={`${modal}-${editingPeriod?.id || editingPerson?.id || "new"}`} className="modal" onSubmit={submitModal}><button className="modal-close" type="button" onClick={() => { setModal(""); setEditingPeriod(null); setEditingPerson(null); }} aria-label="Close"><X size={18} /></button><span className="modal-symbol"><Sparkles size={20} /></span><h2>{modal === "period" ? `${editingPeriod ? "Edit" : "Add"} timetable entry` : `${editingPerson ? "Edit" : "Add"} a person`}</h2><p>{modal === "period" ? "Choose a course year, hour and duration. Labs can span multiple hours." : editingPerson ? "Update this person's directory details. Update the Gmail address used for timetable notices." : "New contacts are enabled for timetable emails by default. You can pause email delivery from the People list."}</p>{modal === "period" ? <div className="modal-fields"><label>Course year<select name="cohort" defaultValue={editingPeriod?.cohort || cohort}>{cohorts.map((item) => <option key={item} value={item}>{item} · {item === "AMCA" ? "1st year" : "2nd year"}</option>)}</select></label><label>Day order<select name="day_order" defaultValue={editingPeriod?.day_order || order}>{dayOrders.map((day) => <option key={day} value={day}>Day {day}</option>)}</select></label><label>Starting hour<select name="period_number" defaultValue={editingPeriod?.period_number || 1}>{[1, 2, 3, 4, 5, 6].map((hour) => <option key={hour} value={hour}>{hour} Hr</option>)}</select></label><label>Duration<select name="duration_hours" defaultValue={editingPeriod?.duration_hours || 1}>{[1, 2, 3, 4, 5, 6].map((hours) => <option key={hours} value={hours}>{hours} {hours === 1 ? "hour" : "hours"}</option>)}</select></label><label>Subject<input name="subject" defaultValue={editingPeriod?.subject || ""} placeholder="e.g. SE LAB" required /></label><label>Class<input name="class_name" defaultValue={editingPeriod?.class_name || cohort} required /></label><label>Teacher<select name="teacher_name" defaultValue={editingPeriod?.teacher_name || ""} required><option value="" disabled>Select a teacher</option>{editingPeriod?.teacher_name && !teachers.some((person) => person.name === editingPeriod.teacher_name) && <option value={editingPeriod.teacher_name}>{editingPeriod.teacher_name} · no longer in directory</option>}{teachers.map((teacher) => <option key={teacher.id} value={teacher.name}>{teacher.name}</option>)}<option value="Unassigned">Unassigned</option></select></label><label>Room<input name="room" defaultValue={editingPeriod?.room || ""} required /></label></div> : <div className="modal-fields"><label>Name<input name="name" defaultValue={editingPerson?.name || ""} minLength="2" required /></label><label>Role<select name="role" value={personRole} onChange={(event) => setPersonRole(event.target.value)}><option>Student</option><option>Teacher</option></select></label>{personRole === "Student" ? <label>Student cohort<select name="cohort" defaultValue={editingPerson?.role === "Student" ? editingPerson.group_name : "AMCA"} required><option value="AMCA">AMCA · 1st year</option><option value="NMCA">NMCA · 2nd year</option></select></label> : <label>Teacher department<input name="group_name" defaultValue={editingPerson?.role === "Teacher" ? editingPerson.group_name : "MCA"} required /></label>}<label>Gmail address<input name="email" type="email" defaultValue={editingPerson?.email || ""} maxLength="254" placeholder="student@gmail.com" required /></label><label className="settings-toggle"><input type="checkbox" name="email_opt_in" defaultChecked={editingPerson ? editingPerson.email_opt_in : true} /> Enable timetable emails</label></div>}{modal === "period" && editingPeriod && <button className="button button-danger button-full" type="button" disabled={busy} onClick={deletePeriod}>Delete timetable entry</button>}<button className="button button-dark button-full" disabled={busy}>{busy ? "Saving…" : modal === "period" && editingPeriod ? "Save timetable changes" : modal === "person" && editingPerson ? "Save person changes" : "Save to database"}</button></form></div>}
     </div>
   );
